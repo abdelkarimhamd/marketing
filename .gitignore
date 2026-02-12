@@ -1,0 +1,22 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Root-level logs
+*.log
+
+# Keep local env files private
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Dependency/build output (already ignored in subprojects; duplicated here for safety)
+backend/vendor/
+backend/node_modules/
+backend/public/build/
+backend/public/hot
+admin/node_modules/
+admin/dist/
+admin/dist-ssr/
