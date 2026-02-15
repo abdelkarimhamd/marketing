@@ -4,10 +4,16 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Activity;
+use App\Models\LeadForm;
 use App\Models\Lead;
 use App\Models\Tag;
 use App\Models\Tenant;
+use App\Services\BrandResolutionService;
+use App\Services\ConsentService;
+use App\Services\CustomFieldService;
 use App\Services\LeadAssignmentService;
+use App\Services\LeadEnrichmentService;
+use App\Services\RealtimeEventService;
 use App\Support\UnsubscribeToken;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -22,7 +28,12 @@ class PublicLeadController extends Controller
     public function store(
         Request $request,
         UnsubscribeToken $unsubscribeToken,
-        LeadAssignmentService $assignmentService
+        LeadAssignmentService $assignmentService,
+        LeadEnrichmentService $leadEnrichmentService,
+        BrandResolutionService $brandResolutionService,
+        CustomFieldService $customFieldService,
+        ConsentService $consentService,
+        RealtimeEventService $eventService
     ): JsonResponse
     {
         $tenant = $request->attributes->get('tenant');
@@ -34,10 +45,11 @@ class PublicLeadController extends Controller
         $data = $request->validate([
             'first_name' => ['nullable', 'string', 'max:100'],
             'last_name' => ['nullable', 'string', 'max:100'],
-            'email' => ['nullable', 'email:rfc', 'max:255', 'required_without:phone'],
-            'phone' => ['nullable', 'string', 'max:32', 'required_without:email'],
+            'email' => ['nullable', 'email:rfc', 'max:255'],
+            'phone' => ['nullable', 'string', 'max:32'],
             'company' => ['nullable', 'string', 'max:255'],
             'city' => ['nullable', 'string', 'max:150'],
+            'country_code' => ['nullable', 'string', 'max:8'],
             'interest' => ['nullable', 'string', 'max:150'],
             'service' => ['nullable', 'string', 'max:150'],
             'title' => ['nullable', 'string', 'max:255'],
@@ -46,14 +58,60 @@ class PublicLeadController extends Controller
             'tags' => ['nullable', 'array', 'max:25'],
             'tags.*' => ['string', 'max:80'],
             'meta' => ['nullable', 'array'],
+            'locale' => ['nullable', 'string', 'max:12'],
             'email_consent' => ['nullable', 'boolean'],
             'auto_assign' => ['nullable', 'boolean'],
+            'form_slug' => ['nullable', 'string', 'max:120'],
+            'brand_id' => ['nullable', 'integer', 'min:1'],
+            'brand_slug' => ['nullable', 'string', 'max:120'],
             'website' => ['prohibited'],
             'api_key' => ['nullable', 'string', 'max:255'],
         ]);
 
+        $formSlug = trim((string) ($data['form_slug'] ?? $request->header('X-Form-Slug', '')));
+        $mappedLeadData = [];
+        $mappedCustomValues = [];
+
+        if ($formSlug !== '') {
+            $form = LeadForm::query()
+                ->withoutTenancy()
+                ->where('tenant_id', $tenant->id)
+                ->where('slug', $formSlug)
+                ->where('is_active', true)
+                ->first();
+
+            if ($form === null) {
+                abort(422, 'Provided form_slug was not found for tenant.');
+            }
+
+            $mapped = $customFieldService->mapFormPayload($form, $request->all());
+            $mappedLeadData = is_array($mapped['lead'] ?? null) ? $mapped['lead'] : [];
+            $mappedCustomValues = is_array($mapped['custom_values'] ?? null) ? $mapped['custom_values'] : [];
+        }
+
+        $data = array_merge($mappedLeadData, $data);
+        $data = $leadEnrichmentService->enrich($data);
+        $brand = $brandResolutionService->resolveForTenant($tenant, $request, $data);
+        $explicitBrandRequested = is_numeric($data['brand_id'] ?? null)
+            || (is_string($data['brand_slug'] ?? null) && trim((string) $data['brand_slug']) !== '');
+
+        if ($explicitBrandRequested && $brand === null) {
+            abort(422, 'Provided brand_id/brand_slug was not found for tenant.');
+        }
+
+        if (empty($data['email']) && empty($data['phone'])) {
+            abort(422, 'email or phone is required.');
+        }
+
         /** @var Lead $lead */
-        $lead = DB::transaction(function () use ($tenant, $request, $data): Lead {
+        $lead = DB::transaction(function () use (
+            $tenant,
+            $request,
+            $data,
+            $brand,
+            $customFieldService,
+            $mappedCustomValues
+        ): Lead {
             $meta = is_array($data['meta'] ?? null) ? $data['meta'] : [];
             $meta['intake'] = [
                 'ip' => $request->ip(),
@@ -62,10 +120,13 @@ class PublicLeadController extends Controller
                 'referer' => $request->header('Referer'),
                 'tenant_resolution_source' => $request->attributes->get('tenant_resolution_source'),
                 'received_at' => now()->toIso8601String(),
+                'brand_id' => $brand?->id,
+                'brand_slug' => $brand?->slug,
             ];
 
             $lead = Lead::query()->create([
                 'tenant_id' => $tenant->id,
+                'brand_id' => $brand?->id,
                 'first_name' => $data['first_name'] ?? null,
                 'last_name' => $data['last_name'] ?? null,
                 'email' => $data['email'] ?? null,
@@ -76,12 +137,14 @@ class PublicLeadController extends Controller
                 'phone' => $data['phone'] ?? null,
                 'company' => $data['company'] ?? null,
                 'city' => $data['city'] ?? null,
+                'country_code' => $data['country_code'] ?? null,
                 'interest' => $data['interest'] ?? null,
                 'service' => $data['service'] ?? null,
                 'title' => $data['title'] ?? null,
                 'status' => 'new',
                 'source' => $data['source']
                     ?? ($request->header('X-Api-Key') ? 'api' : 'website'),
+                'locale' => $data['locale'] ?? null,
                 'meta' => $meta,
             ]);
 
@@ -122,17 +185,52 @@ class PublicLeadController extends Controller
                     'source' => $lead->source,
                     'message' => $data['message'] ?? null,
                     'tenant_resolution_source' => $request->attributes->get('tenant_resolution_source'),
+                    'brand_id' => $brand?->id,
                     'ip' => $request->ip(),
                     'user_agent' => $request->userAgent(),
                 ],
             ]);
 
+            $customFieldService->upsertLeadValues($lead, $mappedCustomValues);
+
             return $lead;
         });
 
-        if (($data['auto_assign'] ?? true) && $lead->owner_id === null) {
+        if (is_string($lead->email) && $lead->email !== '') {
+            $consentService->recordLeadConsent(
+                lead: $lead,
+                channel: 'email',
+                granted: (bool) ($data['email_consent'] ?? true),
+                source: 'public_intake',
+                proofMethod: 'public_form',
+                proofRef: $formSlug !== '' ? $formSlug : 'default',
+                context: [
+                    'tenant_resolution_source' => $request->attributes->get('tenant_resolution_source'),
+                    'origin' => $request->header('Origin'),
+                ],
+                ipAddress: $request->ip(),
+                userAgent: $request->userAgent(),
+            );
+        }
+
+        if ($data['auto_assign'] ?? true) {
             $assignmentService->assignLead($lead->refresh(), 'intake');
         }
+
+        $preference = $consentService->ensureLeadPreference($lead->refresh());
+        $preferenceUrl = route('public.preferences.show', ['token' => $preference->token]);
+
+        $eventService->emit(
+            eventName: 'lead.created',
+            tenantId: (int) $lead->tenant_id,
+            subjectType: Lead::class,
+            subjectId: (int) $lead->id,
+            payload: [
+                'source' => $lead->source,
+                'tenant_resolution_source' => $request->attributes->get('tenant_resolution_source'),
+                'brand_id' => $lead->brand_id,
+            ],
+        );
 
         $unsubscribeUrl = null;
 
@@ -150,7 +248,9 @@ class PublicLeadController extends Controller
         return response()->json([
             'message' => 'Lead created successfully.',
             'lead' => $lead->load('tags'),
+            'brand' => $brand?->only(['id', 'name', 'slug', 'landing_domain']),
             'unsubscribe_url' => $unsubscribeUrl,
+            'preferences_url' => $preferenceUrl,
         ], 201);
     }
 }

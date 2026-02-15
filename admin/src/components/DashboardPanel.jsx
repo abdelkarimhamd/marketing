@@ -24,6 +24,7 @@ function DashboardPanel({ token, tenantId, refreshKey, onNotify }) {
   const [data, setData] = useState({
     metrics: {},
     recent_activities: [],
+    tenant_health: null,
   })
 
   const loadDashboard = useCallback(async () => {
@@ -60,6 +61,36 @@ function DashboardPanel({ token, tenantId, refreshKey, onNotify }) {
         <Grid size={{ xs: 12, sm: 6, lg: 3 }}>{statCard('Pending Webhooks', metrics.webhooks_pending ?? 0, 'Inbox pending')}</Grid>
       </Grid>
 
+      {data.tenant_health && (
+        <Card>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>
+              Tenant Health
+            </Typography>
+            <Divider sx={{ mb: 1.5 }} />
+            <Grid container spacing={1.2}>
+              <Grid size={{ xs: 12, sm: 4 }}>
+                <Typography variant="body2" color="text.secondary">Health Score</Typography>
+                <Typography variant="h5">{data.tenant_health.health_score ?? 0}</Typography>
+              </Grid>
+              <Grid size={{ xs: 12, sm: 4 }}>
+                <Typography variant="body2" color="text.secondary">Deliverability</Typography>
+                <Typography variant="h5">{data.tenant_health.deliverability_rate ?? 0}%</Typography>
+              </Grid>
+              <Grid size={{ xs: 12, sm: 4 }}>
+                <Typography variant="body2" color="text.secondary">Reply Rate</Typography>
+                <Typography variant="h5">{data.tenant_health.reply_rate ?? 0}%</Typography>
+              </Grid>
+            </Grid>
+            {(data.tenant_health.warnings ?? []).map((warning) => (
+              <Typography key={warning} color="warning.main" sx={{ mt: 1 }}>
+                {warning}
+              </Typography>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardContent>
           <Typography variant="h6" gutterBottom>
@@ -73,10 +104,10 @@ function DashboardPanel({ token, tenantId, refreshKey, onNotify }) {
             {(data.recent_activities ?? []).map((activity) => (
               <Paper key={activity.id} variant="outlined" sx={{ p: 1.2 }}>
                 <Typography variant="body2">
-                  <strong>{activity.type}</strong> · {activity.description ?? 'No description'}
+                  <strong>{activity.type}</strong> - {activity.description ?? 'No description'}
                 </Typography>
                 <Typography variant="caption" color="text.secondary">
-                  #{activity.id} · {formatDate(activity.created_at)}
+                  #{activity.id} - {formatDate(activity.created_at)}
                 </Typography>
               </Paper>
             ))}

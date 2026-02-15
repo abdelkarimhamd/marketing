@@ -17,6 +17,18 @@ class AssignmentRule extends Model
 
     public const STRATEGY_INTEREST_SERVICE = 'interest_service';
 
+    public const STRATEGY_RULES_ENGINE = 'rules_engine';
+
+    public const ACTION_ASSIGN = 'assign';
+
+    public const ACTION_CREATE_DEAL = 'create_deal';
+
+    public const ACTION_ADD_TAGS = 'add_tags';
+
+    public const ACTION_START_AUTOMATION = 'start_automation';
+
+    public const ACTION_NOTIFY_CHANNEL = 'notify_channel';
+
     /**
      * The attributes that are mass assignable.
      *
@@ -78,5 +90,36 @@ class AssignmentRule extends Model
     public function fallbackOwner(): BelongsTo
     {
         return $this->belongsTo(User::class, 'fallback_owner_id');
+    }
+
+    /**
+     * Supported rule strategies.
+     *
+     * @return list<string>
+     */
+    public static function supportedStrategies(): array
+    {
+        return [
+            self::STRATEGY_ROUND_ROBIN,
+            self::STRATEGY_CITY,
+            self::STRATEGY_INTEREST_SERVICE,
+            self::STRATEGY_RULES_ENGINE,
+        ];
+    }
+
+    /**
+     * Supported routing action types.
+     *
+     * @return list<string>
+     */
+    public static function supportedActionTypes(): array
+    {
+        return [
+            self::ACTION_ASSIGN,
+            self::ACTION_CREATE_DEAL,
+            self::ACTION_ADD_TAGS,
+            self::ACTION_START_AUTOMATION,
+            self::ACTION_NOTIFY_CHANNEL,
+        ];
     }
 }

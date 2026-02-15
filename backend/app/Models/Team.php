@@ -72,4 +72,12 @@ class Team extends Model
     {
         return $this->hasMany(AssignmentRule::class);
     }
+
+    /**
+     * Appointments linked to this team.
+     */
+    public function appointments(): HasMany
+    {
+        return $this->hasMany(Appointment::class);
+    }
 }

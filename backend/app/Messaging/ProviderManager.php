@@ -11,16 +11,22 @@ use App\Messaging\Providers\MockSmsProvider;
 use App\Messaging\Providers\MockWhatsAppProvider;
 use App\Messaging\Providers\SmtpEmailProvider;
 use App\Messaging\Providers\TwilioSmsProvider;
+use App\Services\TenantEmailConfigurationService;
 use InvalidArgumentException;
 
 class ProviderManager
 {
+    public function __construct(
+        private readonly TenantEmailConfigurationService $tenantEmailConfigurationService,
+    ) {
+    }
+
     /**
      * Resolve configured email provider implementation.
      */
-    public function emailProvider(): EmailProviderInterface
+    public function emailProvider(?int $tenantId = null): EmailProviderInterface
     {
-        $driver = mb_strtolower((string) config('messaging.providers.email', 'mock'));
+        $driver = $this->tenantEmailConfigurationService->providerForTenant($tenantId);
 
         return match ($driver) {
             'mock' => app(MockEmailProvider::class),

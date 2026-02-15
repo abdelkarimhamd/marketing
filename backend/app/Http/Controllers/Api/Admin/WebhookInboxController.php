@@ -15,7 +15,7 @@ class WebhookInboxController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'webhooks.view');
 
         $payload = $request->validate([
             'provider' => ['nullable', 'string', 'max:120'],
@@ -59,22 +59,11 @@ class WebhookInboxController extends Controller
      */
     public function show(Request $request, WebhookInbox $webhookInbox): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'webhooks.view');
 
         return response()->json([
             'webhook' => $webhookInbox,
         ]);
     }
 
-    /**
-     * Ensure caller has admin permission.
-     */
-    private function authorizeAdmin(Request $request): void
-    {
-        $user = $request->user();
-
-        if (! $user || ! $user->isAdmin()) {
-            abort(403, 'Admin permissions are required.');
-        }
-    }
 }

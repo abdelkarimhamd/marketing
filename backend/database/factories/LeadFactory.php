@@ -27,6 +27,7 @@ class LeadFactory extends Factory
     {
         return [
             'tenant_id' => Tenant::factory(),
+            'brand_id' => null,
             'first_name' => fake()->firstName(),
             'last_name' => fake()->lastName(),
             'email' => fake()->unique()->safeEmail(),
@@ -35,12 +36,14 @@ class LeadFactory extends Factory
             'phone' => fake()->phoneNumber(),
             'company' => fake()->company(),
             'city' => fake()->city(),
+            'country_code' => fake()->countryCode(),
             'interest' => fake()->randomElement(['solar', 'crm', 'ads']),
             'service' => fake()->randomElement(['consulting', 'implementation', 'support']),
             'title' => fake()->jobTitle(),
             'status' => 'new',
             'source' => 'seed',
             'score' => fake()->numberBetween(0, 100),
+            'locale' => 'en',
             'meta' => [],
             'settings' => [],
         ];

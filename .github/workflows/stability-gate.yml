@@ -1,0 +1,187 @@
+name: Stability Gate (Tasks 31-50)
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - "admin/**"
+      - "qa/**"
+      - ".github/workflows/stability-gate.yml"
+  workflow_dispatch:
+    inputs:
+      run_load_test:
+        description: "Run k6 load stage"
+        required: false
+        default: "false"
+      open_p0_p1_count:
+        description: "Current open P0/P1 incidents"
+        required: false
+        default: "0"
+
+jobs:
+  backend_regression:
+    name: Backend Regression
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Prepare app
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          php artisan migrate --force
+
+      - name: Run regression gate tests
+        run: >
+          php artisan test
+          --filter="(RegressionMatrixCoverageTest|TenantIsolationModels31To50Test|SecurityRegressionGateTest|TenantConsoleDiagnosticsTest|WorkspaceAnalyticsReportingTest)"
+
+  contract_tests:
+    name: Integration Contract Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Prepare app
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          php artisan migrate --force
+
+      - name: Run contract-focused tests
+        run: >
+          php artisan test
+          --filter="(IntegrationContractRegressionTest|MessagingWebhooksTrackingTest|MetaWhatsAppCloudProviderTest|TenantEmailConfigurationServiceTest)"
+
+  frontend_e2e:
+    name: Frontend E2E (Playwright)
+    if: ${{ vars.E2E_ENABLE_STABILITY == '1' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: admin/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run stability e2e flows
+        env:
+          E2E_ENABLE_STABILITY: "1"
+          E2E_BASE_URL: ${{ vars.E2E_BASE_URL }}
+          E2E_TENANT_ID: ${{ vars.E2E_TENANT_ID }}
+          E2E_PUBLIC_TENANT_ID: ${{ vars.E2E_PUBLIC_TENANT_ID }}
+          E2E_ADMIN_EMAIL: ${{ secrets.E2E_ADMIN_EMAIL }}
+          E2E_ADMIN_PASSWORD: ${{ secrets.E2E_ADMIN_PASSWORD }}
+        run: npm run test:e2e
+
+  load_tests:
+    name: Load Tests (k6)
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_load_test == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Run k6 stability scenario
+        env:
+          BASE_URL: ${{ vars.LOAD_BASE_URL }}
+          BEARER_TOKEN: ${{ secrets.LOAD_BEARER_TOKEN }}
+          TENANT_ID: ${{ vars.LOAD_TENANT_ID }}
+          PUBLIC_TENANT_ID: ${{ vars.LOAD_PUBLIC_TENANT_ID }}
+          CAMPAIGN_ID: ${{ vars.LOAD_CAMPAIGN_ID }}
+          IMPORT_SCHEDULE_ID: ${{ vars.LOAD_IMPORT_SCHEDULE_ID }}
+        run: k6 run qa/k6/stability_gate_load.js
+
+  release_gate:
+    name: Release Gate Decision
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - backend_regression
+      - contract_tests
+      - frontend_e2e
+      - load_tests
+    steps:
+      - name: Evaluate gate conditions
+        env:
+          BACKEND_RESULT: ${{ needs.backend_regression.result }}
+          CONTRACT_RESULT: ${{ needs.contract_tests.result }}
+          E2E_RESULT: ${{ needs.frontend_e2e.result }}
+          LOAD_RESULT: ${{ needs.load_tests.result }}
+          E2E_ENABLED: ${{ vars.E2E_ENABLE_STABILITY }}
+          RUN_LOAD_TEST: ${{ github.event.inputs.run_load_test || 'false' }}
+          OPEN_P0_P1_COUNT: ${{ github.event.inputs.open_p0_p1_count || '0' }}
+        run: |
+          echo "backend=${BACKEND_RESULT}"
+          echo "contract=${CONTRACT_RESULT}"
+          echo "e2e=${E2E_RESULT}"
+          echo "load=${LOAD_RESULT}"
+
+          if [ "${BACKEND_RESULT}" != "success" ]; then
+            echo "Backend regression stage failed."
+            exit 1
+          fi
+
+          if [ "${CONTRACT_RESULT}" != "success" ]; then
+            echo "Contract test stage failed."
+            exit 1
+          fi
+
+          if [ "${E2E_ENABLED}" = "1" ] && [ "${E2E_RESULT}" != "success" ]; then
+            echo "E2E stage failed while E2E gating is enabled."
+            exit 1
+          fi
+
+          if [ "${RUN_LOAD_TEST}" = "true" ] && [ "${LOAD_RESULT}" != "success" ]; then
+            echo "Load stage failed."
+            exit 1
+          fi
+
+          if [ "${OPEN_P0_P1_COUNT}" != "0" ]; then
+            echo "Stop ship: open P0/P1 incidents = ${OPEN_P0_P1_COUNT}"
+            exit 1
+          fi
+
+          echo "Stability gate passed."

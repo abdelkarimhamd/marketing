@@ -20,3 +20,5 @@ backend/public/hot
 admin/node_modules/
 admin/dist/
 admin/dist-ssr/
+portal/node_modules/
+portal/dist/

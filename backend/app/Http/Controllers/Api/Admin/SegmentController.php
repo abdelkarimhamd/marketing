@@ -5,7 +5,9 @@ namespace App\Http\Controllers\Api\Admin;
 use App\Http\Controllers\Controller;
 use App\Models\Activity;
 use App\Models\Segment;
+use App\Services\RealtimeEventService;
 use App\Services\SegmentEvaluationService;
+use App\Services\WorkflowVersioningService;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -20,7 +22,7 @@ class SegmentController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'segments.view');
 
         $filters = $request->validate([
             'search' => ['nullable', 'string', 'max:255'],
@@ -56,9 +58,14 @@ class SegmentController extends Controller
     /**
      * Store a new segment.
      */
-    public function store(Request $request, SegmentEvaluationService $segmentService): JsonResponse
+    public function store(
+        Request $request,
+        SegmentEvaluationService $segmentService,
+        WorkflowVersioningService $workflowVersioningService,
+        RealtimeEventService $eventService
+    ): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'segments.create');
 
         $tenantId = $this->resolveTenantIdForWrite($request);
         $payload = $this->validatePayload($request, $tenantId, isUpdate: false);
@@ -85,6 +92,21 @@ class SegmentController extends Controller
             'description' => 'Segment created from admin module.',
         ]);
 
+        $workflowVersioningService->snapshot(
+            subject: $segment,
+            tenantId: (int) $segment->tenant_id,
+            createdBy: $request->user()?->id,
+            status: 'draft',
+        );
+
+        $eventService->emit(
+            eventName: 'segment.created',
+            tenantId: (int) $segment->tenant_id,
+            subjectType: Segment::class,
+            subjectId: (int) $segment->id,
+            payload: [],
+        );
+
         return response()->json([
             'message' => 'Segment created successfully.',
             'segment' => $segment,
@@ -96,7 +118,7 @@ class SegmentController extends Controller
      */
     public function show(Request $request, Segment $segment): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'segments.view');
 
         return response()->json([
             'segment' => $segment,
@@ -109,9 +131,11 @@ class SegmentController extends Controller
     public function update(
         Request $request,
         Segment $segment,
-        SegmentEvaluationService $segmentService
+        SegmentEvaluationService $segmentService,
+        WorkflowVersioningService $workflowVersioningService,
+        RealtimeEventService $eventService
     ): JsonResponse {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'segments.update');
 
         $payload = $this->validatePayload($request, (int) $segment->tenant_id, true, $segment);
 
@@ -142,6 +166,21 @@ class SegmentController extends Controller
             'description' => 'Segment updated from admin module.',
         ]);
 
+        $workflowVersioningService->snapshot(
+            subject: $segment->refresh(),
+            tenantId: (int) $segment->tenant_id,
+            createdBy: $request->user()?->id,
+            status: 'draft',
+        );
+
+        $eventService->emit(
+            eventName: 'segment.updated',
+            tenantId: (int) $segment->tenant_id,
+            subjectType: Segment::class,
+            subjectId: (int) $segment->id,
+            payload: [],
+        );
+
         return response()->json([
             'message' => 'Segment updated successfully.',
             'segment' => $segment->refresh(),
@@ -153,7 +192,7 @@ class SegmentController extends Controller
      */
     public function destroy(Request $request, Segment $segment): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'segments.delete');
 
         $segment->delete();
 
@@ -179,7 +218,7 @@ class SegmentController extends Controller
         Segment $segment,
         SegmentEvaluationService $segmentService
     ): JsonResponse {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'segments.view');
 
         $payload = $request->validate([
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
@@ -261,15 +300,4 @@ class SegmentController extends Controller
         abort(422, 'Tenant context is required for this operation. Select/supply tenant_id first.');
     }
 
-    /**
-     * Ensure caller has admin permission.
-     */
-    private function authorizeAdmin(Request $request): void
-    {
-        $user = $request->user();
-
-        if (! $user || ! $user->isAdmin()) {
-            abort(403, 'Admin permissions are required.');
-        }
-    }
 }

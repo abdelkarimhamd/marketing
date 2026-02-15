@@ -4,11 +4,18 @@ namespace App\Http\Controllers\Api\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\Activity;
+use App\Models\HighRiskApproval;
 use App\Models\Lead;
+use App\Models\LeadImportPreset;
 use App\Models\Tag;
 use App\Models\Team;
 use App\Models\User;
+use App\Services\CustomFieldService;
+use App\Services\HighRiskApprovalService;
 use App\Services\LeadAssignmentService;
+use App\Services\LeadEnrichmentService;
+use App\Services\LeadImportService;
+use App\Services\RealtimeEventService;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -24,7 +31,7 @@ class LeadController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'leads.view');
 
         $filters = $request->validate([
             'search' => ['nullable', 'string', 'max:255'],
@@ -93,17 +100,107 @@ class LeadController extends Controller
     }
 
     /**
+     * Return tenant-scoped assignment options for leads.
+     */
+    public function assignmentOptions(Request $request): JsonResponse
+    {
+        $this->authorizePermission($request, 'leads.view');
+
+        $tenantId = $this->resolveTenantIdForPermission($request, $request->user());
+
+        if ($tenantId === null) {
+            abort(422, 'Tenant context is required to load assignment options.');
+        }
+
+        $filters = $request->validate([
+            'search' => ['nullable', 'string', 'max:120'],
+            'limit' => ['nullable', 'integer', 'min:1', 'max:200'],
+        ]);
+
+        $search = trim((string) ($filters['search'] ?? ''));
+        $limit = (int) ($filters['limit'] ?? 100);
+
+        $usersQuery = User::query()
+            ->withoutTenancy()
+            ->where('tenant_id', $tenantId)
+            ->where('is_super_admin', false)
+            ->orderBy('name');
+
+        if ($search !== '') {
+            $usersQuery->where(function ($builder) use ($search): void {
+                $builder
+                    ->where('name', 'like', "%{$search}%")
+                    ->orWhere('email', 'like', "%{$search}%");
+            });
+        }
+
+        $teamsQuery = Team::query()
+            ->withoutTenancy()
+            ->where('tenant_id', $tenantId)
+            ->orderBy('name');
+
+        if ($search !== '') {
+            $teamsQuery->where(function ($builder) use ($search): void {
+                $builder
+                    ->where('name', 'like', "%{$search}%")
+                    ->orWhere('slug', 'like', "%{$search}%");
+            });
+        }
+
+        $users = $usersQuery
+            ->limit($limit)
+            ->get(['id', 'name', 'email', 'settings'])
+            ->map(static function (User $user): array {
+                $bookingLink = is_array($user->settings) ? data_get($user->settings, 'booking.link') : null;
+
+                return [
+                    'id' => (int) $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'booking_link' => is_string($bookingLink) && trim($bookingLink) !== '' ? trim($bookingLink) : null,
+                ];
+            })
+            ->values();
+
+        $teams = $teamsQuery
+            ->limit($limit)
+            ->get(['id', 'name', 'settings'])
+            ->map(static function (Team $team): array {
+                $bookingLink = is_array($team->settings) ? data_get($team->settings, 'booking.link') : null;
+
+                return [
+                    'id' => (int) $team->id,
+                    'name' => $team->name,
+                    'booking_link' => is_string($bookingLink) && trim($bookingLink) !== '' ? trim($bookingLink) : null,
+                ];
+            })
+            ->values();
+
+        return response()->json([
+            'users' => $users,
+            'teams' => $teams,
+        ]);
+    }
+
+    /**
      * Store a new lead.
      */
-    public function store(Request $request, LeadAssignmentService $assignmentService): JsonResponse
+    public function store(
+        Request $request,
+        LeadAssignmentService $assignmentService,
+        LeadEnrichmentService $leadEnrichmentService,
+        CustomFieldService $customFieldService,
+        RealtimeEventService $eventService
+    ): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'leads.create');
 
         $tenantId = $this->resolveTenantIdForWrite($request);
         $payload = $this->validateLeadPayload($request, isUpdate: false);
         $this->validateTenantReferences($tenantId, $payload);
+        $payload = $leadEnrichmentService->enrich($payload);
 
-        $lead = DB::transaction(function () use ($payload, $tenantId): Lead {
+        $lead = DB::transaction(function () use ($payload, $tenantId, $customFieldService): Lead {
             $lead = Lead::query()->withoutTenancy()->create([
                 'tenant_id' => $tenantId,
                 'team_id' => $payload['team_id'] ?? null,
@@ -116,12 +213,14 @@ class LeadController extends Controller
                 'phone' => $payload['phone'] ?? null,
                 'company' => $payload['company'] ?? null,
                 'city' => $payload['city'] ?? null,
+                'country_code' => $payload['country_code'] ?? null,
                 'interest' => $payload['interest'] ?? null,
                 'service' => $payload['service'] ?? null,
                 'title' => $payload['title'] ?? null,
                 'status' => $payload['status'] ?? 'new',
                 'source' => $payload['source'] ?? 'admin',
                 'score' => $payload['score'] ?? 0,
+                'locale' => $payload['locale'] ?? null,
                 'meta' => $payload['meta'] ?? null,
                 'settings' => $payload['settings'] ?? null,
             ]);
@@ -138,6 +237,11 @@ class LeadController extends Controller
                 )->all());
             }
 
+            $customFieldService->upsertLeadValues(
+                $lead,
+                is_array($payload['custom_fields'] ?? null) ? $payload['custom_fields'] : []
+            );
+
             Activity::query()->withoutTenancy()->create([
                 'tenant_id' => $tenantId,
                 'actor_id' => $requestUserId = optional(request()->user())->id,
@@ -153,9 +257,21 @@ class LeadController extends Controller
             return $lead;
         });
 
-        if (($payload['auto_assign'] ?? true) && $lead->owner_id === null) {
+        if ($payload['auto_assign'] ?? true) {
             $assignmentService->assignLead($lead->refresh(), 'manual');
         }
+
+        $eventService->emit(
+            eventName: 'lead.created',
+            tenantId: (int) $lead->tenant_id,
+            subjectType: Lead::class,
+            subjectId: (int) $lead->id,
+            payload: [
+                'owner_id' => $lead->owner_id,
+                'status' => $lead->status,
+                'source' => $lead->source,
+            ],
+        );
 
         return response()->json([
             'message' => 'Lead created successfully.',
@@ -168,7 +284,7 @@ class LeadController extends Controller
      */
     public function show(Request $request, Lead $lead): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'leads.view');
 
         return response()->json([
             'lead' => $lead->load(['owner:id,name,email', 'team:id,name', 'tags:id,name,slug,color']),
@@ -178,14 +294,20 @@ class LeadController extends Controller
     /**
      * Update a lead.
      */
-    public function update(Request $request, Lead $lead): JsonResponse
+    public function update(
+        Request $request,
+        Lead $lead,
+        CustomFieldService $customFieldService,
+        RealtimeEventService $eventService
+    ): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'leads.update');
+        $previousStatus = (string) $lead->status;
 
         $payload = $this->validateLeadPayload($request, isUpdate: true);
         $this->validateTenantReferences((int) $lead->tenant_id, $payload);
 
-        DB::transaction(function () use ($request, $lead, $payload): void {
+        DB::transaction(function () use ($request, $lead, $payload, $customFieldService): void {
             $lead->fill([
                 'team_id' => $payload['team_id'] ?? $lead->team_id,
                 'owner_id' => array_key_exists('owner_id', $payload) ? $payload['owner_id'] : $lead->owner_id,
@@ -197,12 +319,14 @@ class LeadController extends Controller
                 'phone' => $payload['phone'] ?? $lead->phone,
                 'company' => $payload['company'] ?? $lead->company,
                 'city' => $payload['city'] ?? $lead->city,
+                'country_code' => $payload['country_code'] ?? $lead->country_code,
                 'interest' => $payload['interest'] ?? $lead->interest,
                 'service' => $payload['service'] ?? $lead->service,
                 'title' => $payload['title'] ?? $lead->title,
                 'status' => $payload['status'] ?? $lead->status,
                 'source' => $payload['source'] ?? $lead->source,
                 'score' => $payload['score'] ?? $lead->score,
+                'locale' => $payload['locale'] ?? $lead->locale,
                 'meta' => $payload['meta'] ?? $lead->meta,
                 'settings' => $payload['settings'] ?? $lead->settings,
             ]);
@@ -221,6 +345,10 @@ class LeadController extends Controller
                 )->all());
             }
 
+            if (array_key_exists('custom_fields', $payload) && is_array($payload['custom_fields'])) {
+                $customFieldService->upsertLeadValues($lead, $payload['custom_fields']);
+            }
+
             Activity::query()->withoutTenancy()->create([
                 'tenant_id' => $lead->tenant_id,
                 'actor_id' => optional($request->user())->id,
@@ -234,6 +362,31 @@ class LeadController extends Controller
             ]);
         });
 
+        $eventService->emit(
+            eventName: 'lead.updated',
+            tenantId: (int) $lead->tenant_id,
+            subjectType: Lead::class,
+            subjectId: (int) $lead->id,
+            payload: [
+                'owner_id' => $lead->owner_id,
+                'status' => $lead->status,
+                'source' => $lead->source,
+            ],
+        );
+
+        if ($previousStatus !== (string) $lead->status) {
+            $eventService->emit(
+                eventName: 'deal.stage_changed',
+                tenantId: (int) $lead->tenant_id,
+                subjectType: Lead::class,
+                subjectId: (int) $lead->id,
+                payload: [
+                    'from' => $previousStatus,
+                    'to' => (string) $lead->status,
+                ],
+            );
+        }
+
         return response()->json([
             'message' => 'Lead updated successfully.',
             'lead' => $lead->refresh()->load(['owner:id,name,email', 'team:id,name', 'tags:id,name,slug,color']),
@@ -243,9 +396,46 @@ class LeadController extends Controller
     /**
      * Delete a lead.
      */
-    public function destroy(Request $request, Lead $lead): JsonResponse
+    public function destroy(
+        Request $request,
+        Lead $lead,
+        HighRiskApprovalService $approvalService
+    ): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'leads.delete');
+
+        $payload = $request->validate([
+            'approval_id' => ['nullable', 'integer', 'min:1'],
+            'approval_reason' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $user = $request->user();
+
+        if (! $user instanceof User) {
+            abort(401, 'Authentication is required.');
+        }
+
+        $approvalDecision = $approvalService->authorizeOrRequest(
+            tenantId: (int) $lead->tenant_id,
+            actor: $user,
+            action: 'lead.delete',
+            subjectType: Lead::class,
+            subjectId: (int) $lead->id,
+            payload: [
+                'lead_id' => (int) $lead->id,
+                'email' => $lead->email,
+            ],
+            approvalId: isset($payload['approval_id']) ? (int) $payload['approval_id'] : null,
+            reason: $payload['approval_reason'] ?? null,
+        );
+
+        if (! ($approvalDecision['execute'] ?? false)) {
+            return response()->json([
+                'message' => 'Lead deletion requires approval before execution.',
+                'requires_approval' => true,
+                'approval' => $approvalDecision['approval'] ?? null,
+            ], 202);
+        }
 
         $lead->delete();
 
@@ -261,17 +451,138 @@ class LeadController extends Controller
             ],
         ]);
 
+        $approval = $approvalDecision['approval'] ?? null;
+
+        if ($approval instanceof HighRiskApproval) {
+            $approvalService->markExecuted(
+                approval: $approval,
+                executedBy: (int) $user->id,
+                executionMeta: [
+                    'action' => 'lead.delete',
+                    'lead_id' => (int) $lead->id,
+                ],
+            );
+        }
+
         return response()->json([
             'message' => 'Lead deleted successfully.',
+            'approval_id' => $approval instanceof HighRiskApproval ? (int) $approval->id : null,
+        ]);
+    }
+
+    /**
+     * Merge one source lead into one target lead.
+     */
+    public function merge(
+        Request $request,
+        HighRiskApprovalService $approvalService,
+        RealtimeEventService $eventService
+    ): JsonResponse {
+        $this->authorizePermission($request, 'leads.delete');
+
+        $tenantId = $this->resolveTenantIdForWrite($request);
+        $payload = $request->validate([
+            'source_lead_id' => ['required', 'integer', 'min:1', 'different:target_lead_id'],
+            'target_lead_id' => ['required', 'integer', 'min:1'],
+            'approval_id' => ['nullable', 'integer', 'min:1'],
+            'approval_reason' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $user = $request->user();
+
+        if (! $user instanceof User) {
+            abort(401, 'Authentication is required.');
+        }
+
+        $sourceId = (int) $payload['source_lead_id'];
+        $targetId = (int) $payload['target_lead_id'];
+
+        $source = Lead::query()
+            ->withoutTenancy()
+            ->where('tenant_id', $tenantId)
+            ->whereKey($sourceId)
+            ->first();
+
+        $target = Lead::query()
+            ->withoutTenancy()
+            ->where('tenant_id', $tenantId)
+            ->whereKey($targetId)
+            ->first();
+
+        if (! $source instanceof Lead || ! $target instanceof Lead) {
+            abort(422, 'Source or target lead does not belong to the active tenant.');
+        }
+
+        $approvalDecision = $approvalService->authorizeOrRequest(
+            tenantId: $tenantId,
+            actor: $user,
+            action: 'lead.merge',
+            subjectType: Lead::class,
+            subjectId: $targetId,
+            payload: [
+                'source_lead_id' => $sourceId,
+                'target_lead_id' => $targetId,
+                'source_email' => $source->email,
+                'target_email' => $target->email,
+            ],
+            approvalId: isset($payload['approval_id']) ? (int) $payload['approval_id'] : null,
+            reason: $payload['approval_reason'] ?? null,
+        );
+
+        if (! ($approvalDecision['execute'] ?? false)) {
+            return response()->json([
+                'message' => 'Lead merge requires approval before execution.',
+                'requires_approval' => true,
+                'approval' => $approvalDecision['approval'] ?? null,
+            ], 202);
+        }
+
+        $mergedLead = $this->performLeadMerge(
+            tenantId: $tenantId,
+            sourceLeadId: $sourceId,
+            targetLeadId: $targetId,
+            actorId: (int) $user->id,
+        );
+
+        $approval = $approvalDecision['approval'] ?? null;
+
+        if ($approval instanceof HighRiskApproval) {
+            $approvalService->markExecuted(
+                approval: $approval,
+                executedBy: (int) $user->id,
+                executionMeta: [
+                    'action' => 'lead.merge',
+                    'source_lead_id' => $sourceId,
+                    'target_lead_id' => $targetId,
+                ],
+            );
+        }
+
+        $eventService->emit(
+            eventName: 'lead.updated',
+            tenantId: $tenantId,
+            subjectType: Lead::class,
+            subjectId: $targetId,
+            payload: [
+                'source' => 'merge',
+                'merged_from_id' => $sourceId,
+            ],
+        );
+
+        return response()->json([
+            'message' => 'Leads merged successfully.',
+            'lead' => $mergedLead->load(['owner:id,name,email', 'team:id,name', 'tags:id,name,slug,color']),
+            'merged_from_id' => $sourceId,
+            'approval_id' => $approval instanceof HighRiskApproval ? (int) $approval->id : null,
         ]);
     }
 
     /**
      * Run bulk actions on selected leads.
      */
-    public function bulk(Request $request): JsonResponse
+    public function bulk(Request $request, RealtimeEventService $eventService): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'leads.update');
 
         $tenantId = $this->resolveTenantIdForWrite($request);
 
@@ -307,7 +618,7 @@ class LeadController extends Controller
             ]);
         }
 
-        DB::transaction(function () use ($request, $payload, $tenantId, $leads): void {
+        DB::transaction(function () use ($request, $payload, $tenantId, $leads, $eventService): void {
             if ($payload['action'] === 'assign') {
                 $this->applyBulkAssign($request, $tenantId, $leads, $payload);
             }
@@ -317,7 +628,7 @@ class LeadController extends Controller
             }
 
             if ($payload['action'] === 'status') {
-                $this->applyBulkStatus($request, $leads, $payload);
+                $this->applyBulkStatus($request, $leads, $payload, $eventService);
             }
         });
 
@@ -331,118 +642,76 @@ class LeadController extends Controller
     /**
      * Import leads and auto-assign when enabled.
      */
-    public function import(Request $request, LeadAssignmentService $assignmentService): JsonResponse
+    public function import(
+        Request $request,
+        LeadImportService $leadImportService
+    ): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'leads.create');
 
         $tenantId = $this->resolveTenantIdForWrite($request);
 
         $payload = $request->validate([
             'auto_assign' => ['nullable', 'boolean'],
+            'mapping_preset_id' => ['nullable', 'integer', 'exists:lead_import_presets,id'],
+            'mapping' => ['nullable', 'array'],
+            'defaults' => ['nullable', 'array'],
+            'dedupe_policy' => ['nullable', Rule::in(['skip', 'update', 'merge'])],
+            'dedupe_keys' => ['nullable', 'array'],
+            'dedupe_keys.*' => [Rule::in(['email', 'phone'])],
             'leads' => ['required', 'array', 'min:1', 'max:1000'],
-            'leads.*.first_name' => ['nullable', 'string', 'max:100'],
-            'leads.*.last_name' => ['nullable', 'string', 'max:100'],
-            'leads.*.email' => ['nullable', 'email:rfc', 'max:255', 'required_without:leads.*.phone'],
-            'leads.*.phone' => ['nullable', 'string', 'max:32', 'required_without:leads.*.email'],
-            'leads.*.company' => ['nullable', 'string', 'max:255'],
-            'leads.*.city' => ['nullable', 'string', 'max:150'],
-            'leads.*.interest' => ['nullable', 'string', 'max:150'],
-            'leads.*.service' => ['nullable', 'string', 'max:150'],
-            'leads.*.title' => ['nullable', 'string', 'max:255'],
-            'leads.*.status' => ['nullable', 'string', 'max:50'],
-            'leads.*.source' => ['nullable', 'string', 'max:100'],
-            'leads.*.score' => ['nullable', 'integer', 'min:0'],
-            'leads.*.email_consent' => ['nullable', 'boolean'],
-            'leads.*.team_id' => ['nullable', 'integer', 'exists:teams,id'],
-            'leads.*.owner_id' => ['nullable', 'integer', 'exists:users,id'],
-            'leads.*.meta' => ['nullable', 'array'],
-            'leads.*.settings' => ['nullable', 'array'],
-            'leads.*.tags' => ['nullable', 'array'],
-            'leads.*.tags.*' => ['string', 'max:80'],
+            'leads.*' => ['required', 'array'],
         ]);
 
-        $autoAssign = (bool) ($payload['auto_assign'] ?? true);
-        $createdIds = [];
-        $assignedCount = 0;
+        $preset = null;
 
-        DB::transaction(function () use (
-            $tenantId,
-            $payload,
-            $assignmentService,
-            $autoAssign,
-            &$createdIds,
-            &$assignedCount
-        ): void {
-            foreach ($payload['leads'] as $row) {
-                $this->validateTenantReferences($tenantId, $row);
+        if (is_numeric($payload['mapping_preset_id'] ?? null)) {
+            $preset = LeadImportPreset::query()
+                ->withoutTenancy()
+                ->where('tenant_id', $tenantId)
+                ->whereKey((int) $payload['mapping_preset_id'])
+                ->first();
 
-                if (empty($row['email']) && empty($row['phone'])) {
-                    abort(422, 'Each imported lead must include email or phone.');
-                }
-
-                $lead = Lead::query()->withoutTenancy()->create([
-                    'tenant_id' => $tenantId,
-                    'team_id' => $row['team_id'] ?? null,
-                    'owner_id' => $row['owner_id'] ?? null,
-                    'first_name' => $row['first_name'] ?? null,
-                    'last_name' => $row['last_name'] ?? null,
-                    'email' => $row['email'] ?? null,
-                    'email_consent' => $row['email_consent'] ?? true,
-                    'consent_updated_at' => now(),
-                    'phone' => $row['phone'] ?? null,
-                    'company' => $row['company'] ?? null,
-                    'city' => $row['city'] ?? null,
-                    'interest' => $row['interest'] ?? null,
-                    'service' => $row['service'] ?? null,
-                    'title' => $row['title'] ?? null,
-                    'status' => $row['status'] ?? 'new',
-                    'source' => $row['source'] ?? 'import',
-                    'score' => $row['score'] ?? 0,
-                    'meta' => $row['meta'] ?? null,
-                    'settings' => $row['settings'] ?? null,
-                ]);
-
-                $tagIds = $this->resolveTagIdsForTenant(
-                    tenantId: $tenantId,
-                    tagIds: [],
-                    tagNames: $row['tags'] ?? [],
-                );
-
-                if ($tagIds->isNotEmpty()) {
-                    $lead->tags()->sync($tagIds->mapWithKeys(
-                        static fn (int $tagId): array => [$tagId => ['tenant_id' => $tenantId]]
-                    )->all());
-                }
-
-                Activity::query()->withoutTenancy()->create([
-                    'tenant_id' => $tenantId,
-                    'actor_id' => optional(request()->user())->id,
-                    'type' => 'lead.imported',
-                    'subject_type' => Lead::class,
-                    'subject_id' => $lead->id,
-                    'description' => 'Lead imported from admin module.',
-                    'properties' => [
-                        'source' => $lead->source,
-                    ],
-                ]);
-
-                if ($autoAssign && $lead->owner_id === null) {
-                    $assignee = $assignmentService->assignLead($lead, 'import');
-
-                    if ($assignee !== null) {
-                        $assignedCount++;
-                    }
-                }
-
-                $createdIds[] = $lead->id;
+            if (! $preset instanceof LeadImportPreset) {
+                abort(422, 'Provided mapping_preset_id does not belong to the active tenant.');
             }
-        });
+        }
+
+        $presetMapping = is_array($preset?->mapping) ? $preset->mapping : [];
+        $presetDefaults = is_array($preset?->defaults) ? $preset->defaults : [];
+        $presetDedupeKeys = is_array($preset?->dedupe_keys) ? $preset->dedupe_keys : ['email', 'phone'];
+
+        $result = $leadImportService->importRows($tenantId, $payload['leads'], [
+            'auto_assign' => $payload['auto_assign'] ?? true,
+            'mapping' => is_array($payload['mapping'] ?? null) ? array_replace_recursive($presetMapping, $payload['mapping']) : $presetMapping,
+            'defaults' => is_array($payload['defaults'] ?? null) ? array_replace_recursive($presetDefaults, $payload['defaults']) : $presetDefaults,
+            'dedupe_policy' => $payload['dedupe_policy'] ?? $preset?->dedupe_policy ?? 'skip',
+            'dedupe_keys' => $payload['dedupe_keys'] ?? $presetDedupeKeys,
+            'source' => 'import',
+            'actor_id' => optional($request->user())->id,
+            'import_meta' => [
+                'preset_id' => $preset?->id,
+            ],
+        ]);
+
+        if ($preset instanceof LeadImportPreset) {
+            $preset->forceFill([
+                'last_used_at' => now(),
+                'updated_by' => optional($request->user())->id,
+            ])->save();
+        }
 
         return response()->json([
             'message' => 'Leads imported successfully.',
-            'created_count' => count($createdIds),
-            'assigned_count' => $assignedCount,
-            'lead_ids' => $createdIds,
+            'created_count' => (int) ($result['created_count'] ?? 0),
+            'updated_count' => (int) ($result['updated_count'] ?? 0),
+            'merged_count' => (int) ($result['merged_count'] ?? 0),
+            'skipped_count' => (int) ($result['skipped_count'] ?? 0),
+            'assigned_count' => (int) ($result['assigned_count'] ?? 0),
+            'lead_ids' => $result['lead_ids'] ?? [],
+            'affected_lead_ids' => $result['affected_lead_ids'] ?? [],
+            'dedupe_policy' => $result['dedupe_policy'] ?? 'skip',
+            'dedupe_keys' => $result['dedupe_keys'] ?? ['email', 'phone'],
         ], 201);
     }
 
@@ -462,17 +731,20 @@ class LeadController extends Controller
             'phone' => [$prefix, 'nullable', 'string', 'max:32'],
             'company' => ['sometimes', 'nullable', 'string', 'max:255'],
             'city' => ['sometimes', 'nullable', 'string', 'max:150'],
+            'country_code' => ['sometimes', 'nullable', 'string', 'max:8'],
             'interest' => ['sometimes', 'nullable', 'string', 'max:150'],
             'service' => ['sometimes', 'nullable', 'string', 'max:150'],
             'title' => ['sometimes', 'nullable', 'string', 'max:255'],
             'status' => ['sometimes', 'nullable', 'string', 'max:50'],
             'source' => ['sometimes', 'nullable', 'string', 'max:100'],
             'score' => ['sometimes', 'nullable', 'integer', 'min:0'],
+            'locale' => ['sometimes', 'nullable', 'string', 'max:12'],
             'team_id' => ['sometimes', 'nullable', 'integer', 'exists:teams,id'],
             'owner_id' => ['sometimes', 'nullable', 'integer', 'exists:users,id'],
             'email_consent' => ['sometimes', 'boolean'],
             'meta' => ['sometimes', 'nullable', 'array'],
             'settings' => ['sometimes', 'nullable', 'array'],
+            'custom_fields' => ['sometimes', 'array'],
             'tag_ids' => ['sometimes', 'array', 'max:100'],
             'tag_ids.*' => ['integer', 'exists:tags,id'],
             'tags' => ['sometimes', 'array', 'max:100'],
@@ -541,18 +813,6 @@ class LeadController extends Controller
     }
 
     /**
-     * Ensure caller has admin permission.
-     */
-    private function authorizeAdmin(Request $request): void
-    {
-        $user = $request->user();
-
-        if (! $user || ! $user->isAdmin()) {
-            abort(403, 'Admin permissions are required.');
-        }
-    }
-
-    /**
      * Resolve tenant-scoped tag IDs from IDs and names.
      *
      * @param list<mixed> $tagIds
@@ -598,6 +858,285 @@ class LeadController extends Controller
             ->filter(static fn (int $id): bool => $id > 0)
             ->unique()
             ->values();
+    }
+
+    /**
+     * Merge source lead into target lead inside one transaction.
+     */
+    private function performLeadMerge(
+        int $tenantId,
+        int $sourceLeadId,
+        int $targetLeadId,
+        int $actorId
+    ): Lead {
+        return DB::transaction(function () use ($tenantId, $sourceLeadId, $targetLeadId, $actorId): Lead {
+            $source = Lead::query()
+                ->withoutTenancy()
+                ->where('tenant_id', $tenantId)
+                ->whereKey($sourceLeadId)
+                ->lockForUpdate()
+                ->first();
+
+            $target = Lead::query()
+                ->withoutTenancy()
+                ->where('tenant_id', $tenantId)
+                ->whereKey($targetLeadId)
+                ->lockForUpdate()
+                ->first();
+
+            if (! $source instanceof Lead || ! $target instanceof Lead) {
+                abort(422, 'Source or target lead could not be found for merge.');
+            }
+
+            if ((int) $source->id === (int) $target->id) {
+                abort(422, 'Source and target leads must be different.');
+            }
+
+            $this->mergeLeadCoreAttributes($target, $source);
+            $target->save();
+
+            $sourceTagIds = $source->tags()
+                ->pluck('tags.id')
+                ->map(static fn (mixed $id): int => (int) $id)
+                ->filter(static fn (int $id): bool => $id > 0)
+                ->unique()
+                ->values();
+
+            if ($sourceTagIds->isNotEmpty()) {
+                $target->tags()->syncWithoutDetaching($sourceTagIds->mapWithKeys(
+                    static fn (int $tagId): array => [$tagId => ['tenant_id' => $tenantId]]
+                )->all());
+            }
+
+            DB::table('lead_tag')
+                ->where('tenant_id', $tenantId)
+                ->where('lead_id', $sourceLeadId)
+                ->delete();
+
+            $this->mergeLeadCustomFieldValues($tenantId, $sourceLeadId, $targetLeadId);
+            $this->reassignLeadForeignKeys($tenantId, $sourceLeadId, $targetLeadId);
+
+            $sourceMeta = is_array($source->meta) ? $source->meta : [];
+            $sourceMeta['merged_into_lead_id'] = $targetLeadId;
+            $sourceMeta['merged_at'] = now()->toIso8601String();
+
+            $source->forceFill([
+                'status' => 'merged',
+                'meta' => $sourceMeta,
+            ])->save();
+
+            $source->delete();
+
+            Activity::query()->withoutTenancy()->create([
+                'tenant_id' => $tenantId,
+                'actor_id' => $actorId,
+                'type' => 'lead.admin.merged',
+                'subject_type' => Lead::class,
+                'subject_id' => $targetLeadId,
+                'description' => 'Lead merged from admin module.',
+                'properties' => [
+                    'source_lead_id' => $sourceLeadId,
+                    'target_lead_id' => $targetLeadId,
+                ],
+            ]);
+
+            return $target->refresh();
+        });
+    }
+
+    /**
+     * Merge scalar + json attributes, preferring non-empty target values.
+     */
+    private function mergeLeadCoreAttributes(Lead $target, Lead $source): void
+    {
+        $scalarFields = [
+            'first_name',
+            'last_name',
+            'email',
+            'phone',
+            'company',
+            'city',
+            'country_code',
+            'interest',
+            'service',
+            'title',
+            'locale',
+            'source',
+        ];
+
+        foreach ($scalarFields as $field) {
+            $targetValue = $target->getAttribute($field);
+            $sourceValue = $source->getAttribute($field);
+
+            if ($this->isBlankValue($targetValue) && ! $this->isBlankValue($sourceValue)) {
+                $target->setAttribute($field, $sourceValue);
+            }
+        }
+
+        if ($target->team_id === null && $source->team_id !== null) {
+            $target->team_id = $source->team_id;
+        }
+
+        if ($target->owner_id === null && $source->owner_id !== null) {
+            $target->owner_id = $source->owner_id;
+        }
+
+        $target->score = max((int) $target->score, (int) $source->score);
+
+        if ($source->email_consent === false) {
+            $target->email_consent = false;
+        }
+
+        if (
+            $target->consent_updated_at === null
+            || ($source->consent_updated_at !== null && $source->consent_updated_at->gt($target->consent_updated_at))
+        ) {
+            $target->consent_updated_at = $source->consent_updated_at;
+        }
+
+        $sourceMeta = is_array($source->meta) ? $source->meta : [];
+        $targetMeta = is_array($target->meta) ? $target->meta : [];
+        $target->meta = array_replace_recursive($sourceMeta, $targetMeta);
+
+        $sourceSettings = is_array($source->settings) ? $source->settings : [];
+        $targetSettings = is_array($target->settings) ? $target->settings : [];
+        $target->settings = array_replace_recursive($sourceSettings, $targetSettings);
+    }
+
+    /**
+     * Move lead-linked rows to merged target lead while avoiding duplicates.
+     */
+    private function reassignLeadForeignKeys(int $tenantId, int $sourceLeadId, int $targetLeadId): void
+    {
+        $timestamp = now();
+
+        foreach (['messages', 'consent_events', 'lead_preferences', 'call_logs', 'ai_interactions'] as $table) {
+            DB::table($table)
+                ->where('tenant_id', $tenantId)
+                ->where('lead_id', $sourceLeadId)
+                ->update([
+                    'lead_id' => $targetLeadId,
+                    'updated_at' => $timestamp,
+                ]);
+        }
+
+        DB::table('attachments')
+            ->where('tenant_id', $tenantId)
+            ->where('lead_id', $sourceLeadId)
+            ->update([
+                'lead_id' => $targetLeadId,
+                'updated_at' => $timestamp,
+            ]);
+
+        DB::table('attachments')
+            ->where('tenant_id', $tenantId)
+            ->where('entity_type', 'lead')
+            ->where('entity_id', $sourceLeadId)
+            ->update([
+                'lead_id' => $targetLeadId,
+                'entity_id' => $targetLeadId,
+                'updated_at' => $timestamp,
+            ]);
+
+        DB::table('activities')
+            ->where('tenant_id', $tenantId)
+            ->where('subject_type', Lead::class)
+            ->where('subject_id', $sourceLeadId)
+            ->update([
+                'subject_id' => $targetLeadId,
+                'updated_at' => $timestamp,
+            ]);
+
+        $sourceUnsubscribes = DB::table('unsubscribes')
+            ->where('tenant_id', $tenantId)
+            ->where('lead_id', $sourceLeadId)
+            ->get(['id', 'channel', 'value']);
+
+        foreach ($sourceUnsubscribes as $row) {
+            $duplicateExists = DB::table('unsubscribes')
+                ->where('tenant_id', $tenantId)
+                ->where('channel', $row->channel)
+                ->where('value', $row->value)
+                ->where('id', '!=', $row->id)
+                ->exists();
+
+            if ($duplicateExists) {
+                DB::table('unsubscribes')
+                    ->where('id', $row->id)
+                    ->delete();
+
+                continue;
+            }
+
+            DB::table('unsubscribes')
+                ->where('id', $row->id)
+                ->update([
+                    'lead_id' => $targetLeadId,
+                    'updated_at' => $timestamp,
+                ]);
+        }
+    }
+
+    /**
+     * Merge custom field values without violating unique field constraints.
+     */
+    private function mergeLeadCustomFieldValues(int $tenantId, int $sourceLeadId, int $targetLeadId): void
+    {
+        $timestamp = now();
+
+        $sourceValues = DB::table('lead_custom_field_values')
+            ->where('tenant_id', $tenantId)
+            ->where('lead_id', $sourceLeadId)
+            ->orderBy('id')
+            ->get(['id', 'custom_field_id', 'value']);
+
+        foreach ($sourceValues as $sourceValue) {
+            $targetValue = DB::table('lead_custom_field_values')
+                ->where('tenant_id', $tenantId)
+                ->where('lead_id', $targetLeadId)
+                ->where('custom_field_id', $sourceValue->custom_field_id)
+                ->first(['id', 'value']);
+
+            if ($targetValue === null) {
+                DB::table('lead_custom_field_values')
+                    ->where('id', $sourceValue->id)
+                    ->update([
+                        'lead_id' => $targetLeadId,
+                        'updated_at' => $timestamp,
+                    ]);
+
+                continue;
+            }
+
+            $targetHasValue = $targetValue->value !== null && $targetValue->value !== 'null';
+            $sourceHasValue = $sourceValue->value !== null && $sourceValue->value !== 'null';
+
+            if (! $targetHasValue && $sourceHasValue) {
+                DB::table('lead_custom_field_values')
+                    ->where('id', $targetValue->id)
+                    ->update([
+                        'value' => $sourceValue->value,
+                        'updated_at' => $timestamp,
+                    ]);
+            }
+
+            DB::table('lead_custom_field_values')
+                ->where('id', $sourceValue->id)
+                ->delete();
+        }
+    }
+
+    private function isBlankValue(mixed $value): bool
+    {
+        if ($value === null) {
+            return true;
+        }
+
+        if (is_string($value)) {
+            return trim($value) === '';
+        }
+
+        return false;
     }
 
     /**
@@ -705,13 +1244,19 @@ class LeadController extends Controller
      * @param Collection<int, Lead> $leads
      * @param array<string, mixed> $payload
      */
-    private function applyBulkStatus(Request $request, Collection $leads, array $payload): void
+    private function applyBulkStatus(
+        Request $request,
+        Collection $leads,
+        array $payload,
+        RealtimeEventService $eventService
+    ): void
     {
         if (! isset($payload['status'])) {
             abort(422, 'status is required for status bulk action.');
         }
 
         foreach ($leads as $lead) {
+            $previousStatus = (string) $lead->status;
             $lead->forceFill([
                 'status' => $payload['status'],
             ])->save();
@@ -727,6 +1272,19 @@ class LeadController extends Controller
                     'status' => $payload['status'],
                 ],
             ]);
+
+            if ($previousStatus !== (string) $payload['status']) {
+                $eventService->emit(
+                    eventName: 'deal.stage_changed',
+                    tenantId: (int) $lead->tenant_id,
+                    subjectType: Lead::class,
+                    subjectId: (int) $lead->id,
+                    payload: [
+                        'from' => $previousStatus,
+                        'to' => (string) $payload['status'],
+                    ],
+                );
+            }
         }
     }
 }

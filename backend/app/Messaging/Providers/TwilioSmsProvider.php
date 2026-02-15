@@ -17,7 +17,9 @@ class TwilioSmsProvider implements SmsProviderInterface
     {
         $accountSid = (string) config('messaging.twilio.account_sid', '');
         $authToken = (string) config('messaging.twilio.auth_token', '');
-        $from = (string) config('messaging.twilio.from', '');
+        $from = is_string($message->from) && trim((string) $message->from) !== ''
+            ? trim((string) $message->from)
+            : (string) config('messaging.twilio.from', '');
 
         if ($accountSid === '' || $authToken === '' || $from === '') {
             return ProviderSendResult::failed('twilio', 'Twilio credentials are not configured.');

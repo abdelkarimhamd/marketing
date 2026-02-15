@@ -1,0 +1,326 @@
+{
+  "version": "1.0.0",
+  "generated_for": "Task 51 Stability Gate",
+  "features": [
+    {
+      "feature_id": 31,
+      "feature_name": "Lead enrichment + validation",
+      "api_endpoints": ["/api/admin/leads", "/api/admin/leads/{lead}", "/api/public/leads"],
+      "ui_screens": ["LeadsPanel", "Public lead form"],
+      "background_jobs": ["Lead enrichment pipeline (sync/service-driven)"],
+      "webhooks_integrations": ["Enrichment provider APIs", "Validation providers"],
+      "critical_edge_cases": ["Disposable email", "Invalid phone with valid email", "Partial enrichment timeout"],
+      "expected_db_mutations": ["leads", "activities"],
+      "success_criteria": "Lead save rejects bad data and enriches available fields without blocking intake.",
+      "test_cases": [
+        {"id": "31-HAPPY-01", "type": "happy_path", "scenario": "Create lead with valid email/phone and enrichment enabled.", "expected": "Lead created with quality metadata and normalized fields."},
+        {"id": "31-EDGE-01", "type": "edge_case", "scenario": "Create lead with disposable email domain.", "expected": "Lead flagged or rejected based on tenant policy."},
+        {"id": "31-EDGE-02", "type": "edge_case", "scenario": "Enrichment provider timeout.", "expected": "Lead still created; enrichment failure logged with recoverable status."}
+      ]
+    },
+    {
+      "feature_id": 32,
+      "feature_name": "Routing rules engine",
+      "api_endpoints": ["/api/admin/assignment-rules", "/api/admin/assignment-rules/{assignmentRule}", "/api/public/leads"],
+      "ui_screens": ["AssignmentRulesPanel", "LeadsPanel"],
+      "background_jobs": ["Lead assignment evaluation"],
+      "webhooks_integrations": ["Optional notification integrations"],
+      "critical_edge_cases": ["Conflicting rule priorities", "No eligible assignee", "Working-hours override"],
+      "expected_db_mutations": ["assignment_rules", "leads.owner_id", "activities"],
+      "success_criteria": "Rules apply deterministically and route leads without manual intervention.",
+      "test_cases": [
+        {"id": "32-HAPPY-01", "type": "happy_path", "scenario": "Lead matches top priority active rule.", "expected": "Lead assigned to expected owner and activity logged."},
+        {"id": "32-EDGE-01", "type": "edge_case", "scenario": "Multiple rules match same lead.", "expected": "Highest priority wins consistently."},
+        {"id": "32-EDGE-02", "type": "edge_case", "scenario": "No users available for selected team.", "expected": "Fallback owner or policy path is applied and logged."}
+      ]
+    },
+    {
+      "feature_id": 33,
+      "feature_name": "Attachment support",
+      "api_endpoints": ["/api/admin/attachments", "/api/admin/attachments/{attachment}/download", "/api/admin/attachments/{attachment}"],
+      "ui_screens": ["LeadsPanel attachments", "Deals/Proposal attachment views"],
+      "background_jobs": ["Retention/archive cleanup"],
+      "webhooks_integrations": ["Optional antivirus engines", "S3-compatible storage"],
+      "critical_edge_cases": ["Virus-positive file", "Cross-tenant download attempt", "Expired retention purge"],
+      "expected_db_mutations": ["attachments", "activities", "filesystem objects"],
+      "success_criteria": "Documents are secured, tenant-scoped, and retained/deleted by policy.",
+      "test_cases": [
+        {"id": "33-HAPPY-01", "type": "happy_path", "scenario": "Upload and download valid lead attachment.", "expected": "Attachment stored and downloadable by authorized tenant user."},
+        {"id": "33-EDGE-01", "type": "edge_case", "scenario": "Upload EICAR test payload with scan enabled.", "expected": "Upload rejected with validation error and no DB row."},
+        {"id": "33-EDGE-02", "type": "edge_case", "scenario": "Tenant B attempts to access tenant A attachment.", "expected": "404/403 with no file leakage."}
+      ]
+    },
+    {
+      "feature_id": 34,
+      "feature_name": "Advanced search + saved views",
+      "api_endpoints": ["/api/admin/search", "/api/admin/saved-views", "/api/admin/saved-views/{savedView}"],
+      "ui_screens": ["SearchPanel", "LeadsPanel quick filters"],
+      "background_jobs": ["None required (query-time)"],
+      "webhooks_integrations": ["None"],
+      "critical_edge_cases": ["Invalid filter schema", "Large result sets", "Saved view access across tenants"],
+      "expected_db_mutations": ["saved_views"],
+      "success_criteria": "Users can search globally and persist reusable filters safely.",
+      "test_cases": [
+        {"id": "34-HAPPY-01", "type": "happy_path", "scenario": "Create saved view and reuse it on reload.", "expected": "View persists per tenant/user and returns expected dataset."},
+        {"id": "34-EDGE-01", "type": "edge_case", "scenario": "Malformed search filter payload.", "expected": "Validation error with stable error response."},
+        {"id": "34-EDGE-02", "type": "edge_case", "scenario": "Tenant B fetches tenant A saved view id.", "expected": "Not found/forbidden and no leakage."}
+      ]
+    },
+    {
+      "feature_id": 35,
+      "feature_name": "Knowledge base + playbooks",
+      "api_endpoints": ["/api/admin/playbooks", "/api/admin/playbooks/{playbook}", "/api/admin/playbooks/suggestions"],
+      "ui_screens": ["PlaybooksPanel", "Deal/conversation contextual hints"],
+      "background_jobs": ["Optional AI suggestion generation"],
+      "webhooks_integrations": ["None (internal)"],
+      "critical_edge_cases": ["Inactive playbook referenced", "Missing stage context", "Large playbook content"],
+      "expected_db_mutations": ["playbooks", "activities"],
+      "success_criteria": "Playbooks are manageable per tenant and contextual suggestions remain relevant.",
+      "test_cases": [
+        {"id": "35-HAPPY-01", "type": "happy_path", "scenario": "Create and fetch playbook suggestion for a stage.", "expected": "Suggestion payload includes matching active playbooks."},
+        {"id": "35-EDGE-01", "type": "edge_case", "scenario": "Suggestion request with unknown stage.", "expected": "Empty suggestions, no exception."},
+        {"id": "35-EDGE-02", "type": "edge_case", "scenario": "Tenant with no playbooks.", "expected": "Response succeeds with zero results."}
+      ]
+    },
+    {
+      "feature_id": 36,
+      "feature_name": "Multi-stage approvals (high-risk)",
+      "api_endpoints": ["/api/admin/workflows/versions/*", "/api/admin/approvals", "/api/admin/approvals/{highRiskApproval}/review"],
+      "ui_screens": ["Approvals views", "Workflow publish actions"],
+      "background_jobs": ["Approval notifications (if enabled)"],
+      "webhooks_integrations": ["Optional chat/email notifications"],
+      "critical_edge_cases": ["Double review submission", "Unauthorized approver", "Rejected then publish attempt"],
+      "expected_db_mutations": ["workflow_versions", "approval_requests", "high_risk_approvals", "high_risk_approval_reviews"],
+      "success_criteria": "High-risk operations require maker-checker flow with full audit trail.",
+      "test_cases": [
+        {"id": "36-HAPPY-01", "type": "happy_path", "scenario": "Submit high-risk action and approve by valid approver.", "expected": "Status transitions pending -> approved with audit rows."},
+        {"id": "36-EDGE-01", "type": "edge_case", "scenario": "Same approver posts duplicate review.", "expected": "Idempotent or validation-blocked duplicate."},
+        {"id": "36-EDGE-02", "type": "edge_case", "scenario": "Non-approver user reviews request.", "expected": "Forbidden with no mutation."}
+      ]
+    },
+    {
+      "feature_id": 37,
+      "feature_name": "Data residency + per-tenant encryption keys",
+      "api_endpoints": ["/api/admin/settings", "/api/admin/settings/encryption/rotate"],
+      "ui_screens": ["SettingsPanel security/residency"],
+      "background_jobs": ["Key rotation tasks"],
+      "webhooks_integrations": ["KMS-ready integration layer (future)"],
+      "critical_edge_cases": ["Rotate key with existing encrypted config", "Residency lock attempt downgrade", "Missing key material fallback"],
+      "expected_db_mutations": ["tenant_encryption_keys", "tenants.data_residency_region", "tenants.settings"],
+      "success_criteria": "Tenant secrets stay decryptable across rotations and residency flags are enforced.",
+      "test_cases": [
+        {"id": "37-HAPPY-01", "type": "happy_path", "scenario": "Rotate encryption key for tenant with encrypted settings.", "expected": "New key active and settings remain readable."},
+        {"id": "37-EDGE-01", "type": "edge_case", "scenario": "Attempt unauthorized key rotation.", "expected": "Forbidden with no key change."},
+        {"id": "37-EDGE-02", "type": "edge_case", "scenario": "Set invalid residency region.", "expected": "Validation error and unchanged tenant row."}
+      ]
+    },
+    {
+      "feature_id": 38,
+      "feature_name": "Cost engine + profitability reporting",
+      "api_endpoints": ["/api/admin/billing/profitability", "/api/admin/billing/margin-alerts", "/api/admin/billing/usage"],
+      "ui_screens": ["BillingPanel profitability widgets"],
+      "background_jobs": ["Cost tracking per outbound message"],
+      "webhooks_integrations": ["Provider delivery cost feeds (if configured)"],
+      "critical_edge_cases": ["Zero-revenue mapping", "Negative margin segments", "Cross-tenant global profitability query"],
+      "expected_db_mutations": ["messages cost columns", "billing_usage_records", "billing_invoices"],
+      "success_criteria": "Profitability is measurable and low-margin alerts are accurate.",
+      "test_cases": [
+        {"id": "38-HAPPY-01", "type": "happy_path", "scenario": "Track dispatched message costs and query profitability.", "expected": "Summary metrics match expected cost/revenue/profit values."},
+        {"id": "38-EDGE-01", "type": "edge_case", "scenario": "Messages with no revenue mapping.", "expected": "ROI/margin calculations remain stable and alerts explain reason."},
+        {"id": "38-EDGE-02", "type": "edge_case", "scenario": "Threshold override for margin alerts.", "expected": "Alert list changes based on override value."}
+      ]
+    },
+    {
+      "feature_id": 39,
+      "feature_name": "Customer portal self-service",
+      "api_endpoints": ["/api/public/portal", "/api/public/portal/request-quote", "/api/public/portal/book-demo", "/api/public/portal/upload-documents", "/api/public/portal/status/{token}"],
+      "ui_screens": ["Public portal page", "Admin lead pipeline"],
+      "background_jobs": ["Attachment storage", "Lead activity generation"],
+      "webhooks_integrations": ["Optional calendar/inbox hooks"],
+      "critical_edge_cases": ["Invalid tracking token", "Portal disabled per tenant", "Upload exceeds policy limits"],
+      "expected_db_mutations": ["leads", "activities", "appointments", "attachments"],
+      "success_criteria": "Branded portal captures, qualifies, and tracks lead progress correctly.",
+      "test_cases": [
+        {"id": "39-HAPPY-01", "type": "happy_path", "scenario": "Submit request quote from portal with valid tenant context.", "expected": "Lead created with portal source and activity trace."},
+        {"id": "39-EDGE-01", "type": "edge_case", "scenario": "Query portal status with invalid token.", "expected": "Not found/forbidden without data disclosure."},
+        {"id": "39-EDGE-02", "type": "edge_case", "scenario": "Upload disallowed file type to portal.", "expected": "Validation failure and no attachment row."}
+      ]
+    },
+    {
+      "feature_id": 40,
+      "feature_name": "Bot automation with handoff",
+      "api_endpoints": ["/api/public/chat/widget", "/api/public/chat/message", "/api/webhooks/whatsapp/{provider}", "/api/admin/inbox"],
+      "ui_screens": ["Chat widget", "InboxPanel"],
+      "background_jobs": ["Bot routing and escalation handling"],
+      "webhooks_integrations": ["Meta WhatsApp", "Webhook inbox"],
+      "critical_edge_cases": ["Unsupported provider payload", "Failed webhook parsing", "Handoff when no agents online"],
+      "expected_db_mutations": ["messages", "webhooks_inbox", "activities"],
+      "success_criteria": "Inbound chat is auto-qualified and routed with safe fallback to agents.",
+      "test_cases": [
+        {"id": "40-HAPPY-01", "type": "happy_path", "scenario": "Inbound WhatsApp message triggers bot response and creates thread.", "expected": "Message thread created and visible in inbox."},
+        {"id": "40-EDGE-01", "type": "edge_case", "scenario": "Malformed webhook payload.", "expected": "Webhook marked failed with error metadata."},
+        {"id": "40-EDGE-02", "type": "edge_case", "scenario": "No available agent for handoff.", "expected": "Queue/fallback route applied and logged."}
+      ]
+    },
+    {
+      "feature_id": 41,
+      "feature_name": "Multi-brand per tenant",
+      "api_endpoints": ["/api/admin/brands", "/api/admin/brands/{brand}", "/api/admin/campaigns", "/api/admin/templates"],
+      "ui_screens": ["Settings brands", "CampaignsPanel", "TemplatesPanel"],
+      "background_jobs": ["Message dispatch brand resolution"],
+      "webhooks_integrations": ["Email/SMS/WhatsApp sender identity by brand"],
+      "critical_edge_cases": ["Inactive brand selected", "Brand credentials missing", "Cross-tenant brand_id reference"],
+      "expected_db_mutations": ["brands", "campaigns.brand_id", "templates.brand_id", "messages.brand_id"],
+      "success_criteria": "Each brand sends with correct identity and tenant isolation remains intact.",
+      "test_cases": [
+        {"id": "41-HAPPY-01", "type": "happy_path", "scenario": "Create two brands and send campaigns from each.", "expected": "Outbound messages use selected brand sender fields."},
+        {"id": "41-EDGE-01", "type": "edge_case", "scenario": "Attempt campaign launch with inactive brand.", "expected": "Validation/dispatch block with actionable error."},
+        {"id": "41-EDGE-02", "type": "edge_case", "scenario": "Tenant B references brand from tenant A.", "expected": "Forbidden/not found; no cross-tenant write."}
+      ]
+    },
+    {
+      "feature_id": 42,
+      "feature_name": "Agent routing by availability",
+      "api_endpoints": ["/api/admin/users/{user}/availability", "/api/admin/leads", "/api/admin/assignment-rules"],
+      "ui_screens": ["Users availability settings", "AssignmentRulesPanel"],
+      "background_jobs": ["Assignment engine execution"],
+      "webhooks_integrations": ["Optional status integrations"],
+      "critical_edge_cases": ["Agent offline", "Agent over max active leads", "Holiday schedule conflict"],
+      "expected_db_mutations": ["users.settings.assignment.availability", "leads.owner_id", "activities"],
+      "success_criteria": "Routing avoids unavailable agents and auto-reassigns to eligible users.",
+      "test_cases": [
+        {"id": "42-HAPPY-01", "type": "happy_path", "scenario": "Lead intake during working hours with available agents.", "expected": "Lead assigned to eligible user under policy."},
+        {"id": "42-EDGE-01", "type": "edge_case", "scenario": "All team members marked offline.", "expected": "Fallback owner or pending assignment is applied."},
+        {"id": "42-EDGE-02", "type": "edge_case", "scenario": "Primary owner exceeds max active leads.", "expected": "Assignment engine selects alternative user."}
+      ]
+    },
+    {
+      "feature_id": 43,
+      "feature_name": "Appointment booking + calendar sync",
+      "api_endpoints": ["/api/admin/appointments", "/api/public/portal/book-demo", "/api/admin/users/{user}/booking-link", "/api/admin/teams/{team}/booking-link"],
+      "ui_screens": ["Appointments", "Portal booking", "User/team settings"],
+      "background_jobs": ["Calendar sync service"],
+      "webhooks_integrations": ["Google Calendar", "Microsoft Calendar"],
+      "critical_edge_cases": ["Double booking time slot", "Calendar sync API failure", "Timezone mismatch"],
+      "expected_db_mutations": ["appointments", "activities", "leads/deals state updates"],
+      "success_criteria": "Bookings are captured, synced, and reflected in CRM timeline.",
+      "test_cases": [
+        {"id": "43-HAPPY-01", "type": "happy_path", "scenario": "Create appointment with valid slot and owner.", "expected": "Appointment row created and sync attempted."},
+        {"id": "43-EDGE-01", "type": "edge_case", "scenario": "Calendar provider returns failure.", "expected": "Booking kept with sync error metadata and retry path."},
+        {"id": "43-EDGE-02", "type": "edge_case", "scenario": "Booking request uses unavailable time.", "expected": "Validation rejects conflict or returns alternate slots."}
+      ]
+    },
+    {
+      "feature_id": 44,
+      "feature_name": "Proposal/quotation generator",
+      "api_endpoints": ["/api/admin/proposal-templates", "/api/admin/proposals/generate", "/api/admin/proposals/{proposal}/send"],
+      "ui_screens": ["Proposal templates", "Proposal generation flow"],
+      "background_jobs": ["PDF generation", "Delivery tracking"],
+      "webhooks_integrations": ["Email/WhatsApp delivery providers"],
+      "critical_edge_cases": ["Template variable missing", "PDF storage failure", "Duplicate accept/open events"],
+      "expected_db_mutations": ["proposal_templates", "proposals", "attachments", "activities"],
+      "success_criteria": "Sales users can produce, send, and track proposal lifecycle events.",
+      "test_cases": [
+        {"id": "44-HAPPY-01", "type": "happy_path", "scenario": "Generate proposal from template and send.", "expected": "Proposal version created, attachment stored, send event logged."},
+        {"id": "44-EDGE-01", "type": "edge_case", "scenario": "Generate with missing required merge field.", "expected": "Validation error with no partial proposal persisted."},
+        {"id": "44-EDGE-02", "type": "edge_case", "scenario": "Repeat open webhook for same proposal.", "expected": "Tracking remains idempotent without duplicate stage changes."}
+      ]
+    },
+    {
+      "feature_id": 45,
+      "feature_name": "WhatsApp rich media/catalog messages",
+      "api_endpoints": ["/api/admin/media-library", "/api/admin/templates", "/api/admin/campaigns/{campaign}/launch"],
+      "ui_screens": ["Media library", "Template builder", "Campaign launch"],
+      "background_jobs": ["SendCampaignMessageJob"],
+      "webhooks_integrations": ["Meta WhatsApp Cloud API"],
+      "critical_edge_cases": ["Unsupported media type", "Missing catalog id", "Provider rejects payload schema"],
+      "expected_db_mutations": ["attachments (media)", "templates.whatsapp_variables", "messages", "webhooks_inbox"],
+      "success_criteria": "Rich WhatsApp content sends with provider-compatible payloads and auditable errors.",
+      "test_cases": [
+        {"id": "45-HAPPY-01", "type": "happy_path", "scenario": "Send catalog/list message with valid media payload.", "expected": "Provider accepts and message status transitions to sent."},
+        {"id": "45-EDGE-01", "type": "edge_case", "scenario": "Template missing media link/provider id.", "expected": "Dispatch fails with explicit validation error metadata."},
+        {"id": "45-EDGE-02", "type": "edge_case", "scenario": "Upload media beyond policy limits.", "expected": "Upload blocked and no template references invalid asset."}
+      ]
+    },
+    {
+      "feature_id": 46,
+      "feature_name": "Import 2.0 (scheduled + dedupe + presets)",
+      "api_endpoints": ["/api/admin/lead-import/presets", "/api/admin/lead-import/schedules", "/api/admin/lead-import/schedules/{leadImportSchedule}/run"],
+      "ui_screens": ["Leads import module"],
+      "background_jobs": ["imports:run-scheduled"],
+      "webhooks_integrations": ["SFTP/URL source systems"],
+      "critical_edge_cases": ["Broken source URL", "Malformed CSV headers", "Dedupe merge conflict"],
+      "expected_db_mutations": ["lead_import_presets", "lead_import_schedules", "leads", "activities"],
+      "success_criteria": "Scheduled imports run predictably with configurable dedupe policies.",
+      "test_cases": [
+        {"id": "46-HAPPY-01", "type": "happy_path", "scenario": "Create preset + schedule and run now.", "expected": "Expected lead create/update/merge counts are returned."},
+        {"id": "46-EDGE-01", "type": "edge_case", "scenario": "Schedule points to unavailable source.", "expected": "last_status=failed with diagnostic last_error."},
+        {"id": "46-EDGE-02", "type": "edge_case", "scenario": "Dedupe policy merge with conflicting values.", "expected": "Merge policy rules applied consistently and logged."}
+      ]
+    },
+    {
+      "feature_id": 47,
+      "feature_name": "Dynamic personalization engine",
+      "api_endpoints": ["/api/admin/templates/{template}/render", "/api/admin/templates", "/api/admin/campaigns"],
+      "ui_screens": ["TemplatesPanel preview", "Campaign message preview"],
+      "background_jobs": ["Message rendering during generation"],
+      "webhooks_integrations": ["None"],
+      "critical_edge_cases": ["Missing variable fallback", "Invalid conditional expression", "Locale block missing"],
+      "expected_db_mutations": ["templates", "messages.body/subject"],
+      "success_criteria": "Templates render conditionals/localization safely with deterministic fallbacks.",
+      "test_cases": [
+        {"id": "47-HAPPY-01", "type": "happy_path", "scenario": "Render template with lead city and locale conditions.", "expected": "Output reflects correct conditional/localized block."},
+        {"id": "47-EDGE-01", "type": "edge_case", "scenario": "Unknown variable in template.", "expected": "Fallback value used and rendering does not crash."},
+        {"id": "47-EDGE-02", "type": "edge_case", "scenario": "Malformed condition syntax.", "expected": "Render endpoint returns validation error."}
+      ]
+    },
+    {
+      "feature_id": 48,
+      "feature_name": "Campaign fatigue control",
+      "api_endpoints": ["/api/admin/campaigns/{campaign}/launch", "/api/admin/compliance", "/api/admin/leads"],
+      "ui_screens": ["CampaignsPanel", "Compliance settings"],
+      "background_jobs": ["GenerateCampaignMessagesJob", "SendCampaignMessageJob"],
+      "webhooks_integrations": ["Delivery/open/reply webhooks for engagement signals"],
+      "critical_edge_cases": ["Lead over suppression threshold", "Re-engagement override", "Suppression with sparse event history"],
+      "expected_db_mutations": ["messages", "leads.settings/meta", "activities"],
+      "success_criteria": "Unengaged leads are suppressed after policy threshold to protect deliverability.",
+      "test_cases": [
+        {"id": "48-HAPPY-01", "type": "happy_path", "scenario": "Lead with healthy engagement remains targetable.", "expected": "Messages generated and sent normally."},
+        {"id": "48-EDGE-01", "type": "edge_case", "scenario": "Lead exceeds fatigue threshold.", "expected": "Further sends blocked with suppression reason logged."},
+        {"id": "48-EDGE-02", "type": "edge_case", "scenario": "Lead enters re-engagement segment.", "expected": "Suppression lifted per policy for reactivation flow."}
+      ]
+    },
+    {
+      "feature_id": 49,
+      "feature_name": "Customer success console",
+      "api_endpoints": ["/api/admin/tenant-console"],
+      "ui_screens": ["CustomerSuccessPanel"],
+      "background_jobs": ["tenants:health:snapshot"],
+      "webhooks_integrations": ["Domain verification checks", "Integration diagnostics"],
+      "critical_edge_cases": ["No tenants", "Single-tenant filter", "Tenant admin unauthorized access"],
+      "expected_db_mutations": ["tenant_health_snapshots (snapshot command)", "none for read endpoint"],
+      "success_criteria": "Support team sees tenant diagnostics + actionable fix suggestions quickly.",
+      "test_cases": [
+        {"id": "49-HAPPY-01", "type": "happy_path", "scenario": "Super admin opens tenant console with mixed tenant health.", "expected": "Summary and fix suggestions show correct severities."},
+        {"id": "49-EDGE-01", "type": "edge_case", "scenario": "Filter by tenant_id.", "expected": "Only selected tenant is returned with accurate summary counts."},
+        {"id": "49-EDGE-02", "type": "edge_case", "scenario": "Tenant admin calls endpoint.", "expected": "Forbidden response."}
+      ]
+    },
+    {
+      "feature_id": 50,
+      "feature_name": "Multi-workspace analytics",
+      "api_endpoints": ["/api/admin/billing/workspace-analytics", "/api/admin/billing/workspace-analytics/export"],
+      "ui_screens": ["WorkspaceAnalyticsPanel"],
+      "background_jobs": ["Optional scheduled BI export"],
+      "webhooks_integrations": ["BI ingestion via CSV"],
+      "critical_edge_cases": ["Empty period", "Invalid tenant filters", "Tenant admin unauthorized"],
+      "expected_db_mutations": ["none for report read", "export artifact stream only"],
+      "success_criteria": "Super admin can compare tenant/channel growth and export BI-ready CSV.",
+      "test_cases": [
+        {"id": "50-HAPPY-01", "type": "happy_path", "scenario": "Fetch workspace analytics for date range.", "expected": "Summary, tenant/channel breakdown, and trends are populated."},
+        {"id": "50-EDGE-01", "type": "edge_case", "scenario": "Export CSV for same period.", "expected": "CSV includes tenant and channel rows with growth metrics."},
+        {"id": "50-EDGE-02", "type": "edge_case", "scenario": "Tenant admin attempts access.", "expected": "Forbidden response for analytics and export endpoints."}
+      ]
+    }
+  ]
+}

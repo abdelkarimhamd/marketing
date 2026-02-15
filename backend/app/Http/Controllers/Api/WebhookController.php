@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\WebhookInbox;
+use App\Services\BotConversationService;
+use App\Services\InboundEmailService;
 use App\Services\MessageStatusService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -14,15 +16,22 @@ class WebhookController extends Controller
     /**
      * Handle incoming email provider webhook events.
      */
-    public function email(Request $request, string $provider, MessageStatusService $statusService): JsonResponse
+    public function email(
+        Request $request,
+        string $provider,
+        MessageStatusService $statusService,
+        InboundEmailService $inboundEmailService
+    ): JsonResponse
     {
         $provider = mb_strtolower(trim($provider));
+        $capturedInbound = $this->captureInboundEmailReplies($provider, $request, $inboundEmailService);
 
         return $this->processWebhook(
             request: $request,
             provider: $provider,
             parser: fn (array $payload): array => $this->parseEmailEvents($payload),
             statusService: $statusService,
+            capturedInbound: $capturedInbound,
         );
     }
 
@@ -44,7 +53,12 @@ class WebhookController extends Controller
     /**
      * Handle incoming WhatsApp provider webhook events.
      */
-    public function whatsapp(Request $request, string $provider, MessageStatusService $statusService): Response|JsonResponse
+    public function whatsapp(
+        Request $request,
+        string $provider,
+        MessageStatusService $statusService,
+        BotConversationService $botConversationService
+    ): Response|JsonResponse
     {
         $provider = mb_strtolower(trim($provider));
 
@@ -52,11 +66,18 @@ class WebhookController extends Controller
             return $this->verifyWhatsAppWebhook($provider, $request);
         }
 
+        $capturedInbound = $this->captureInboundWhatsAppMessages(
+            provider: $provider,
+            request: $request,
+            botConversationService: $botConversationService
+        );
+
         return $this->processWebhook(
             request: $request,
             provider: $provider,
             parser: fn (array $payload): array => $this->parseWhatsAppEvents($provider, $payload),
             statusService: $statusService,
+            capturedInbound: $capturedInbound,
         );
     }
 
@@ -69,7 +90,8 @@ class WebhookController extends Controller
         Request $request,
         string $provider,
         callable $parser,
-        MessageStatusService $statusService
+        MessageStatusService $statusService,
+        int $capturedInbound = 0
     ): JsonResponse {
         $payload = $request->all();
         $headers = $this->normalizeHeaders($request->headers->all());
@@ -142,6 +164,7 @@ class WebhookController extends Controller
                 'message' => 'Webhook accepted.',
                 'provider' => $provider,
                 'processed' => $processed,
+                'inbound_captured' => $capturedInbound,
                 'inbox_id' => $inbox->id,
             ]);
         } catch (\Throwable $exception) {
@@ -193,6 +216,57 @@ class WebhookController extends Controller
         }
 
         return $events;
+    }
+
+    /**
+     * Capture inbound email replies and attach them to conversation timeline.
+     */
+    private function captureInboundEmailReplies(
+        string $provider,
+        Request $request,
+        InboundEmailService $inboundEmailService
+    ): int {
+        $payload = $request->all();
+        $rows = isset($payload['events']) && is_array($payload['events'])
+            ? $payload['events']
+            : [$payload];
+
+        $captured = 0;
+
+        foreach ($rows as $row) {
+            if (! is_array($row) || ! $this->looksLikeInboundEmail($row)) {
+                continue;
+            }
+
+            $message = $inboundEmailService->captureInboundReply($provider, $row);
+
+            if ($message !== null) {
+                $captured++;
+            }
+        }
+
+        return $captured;
+    }
+
+    /**
+     * Heuristic to identify inbound reply payloads from email providers.
+     *
+     * @param array<string, mixed> $row
+     */
+    private function looksLikeInboundEmail(array $row): bool
+    {
+        $event = mb_strtolower((string) ($row['event'] ?? $row['type'] ?? ''));
+
+        if (in_array($event, ['inbound', 'reply', 'message.inbound', 'email.inbound'], true)) {
+            return true;
+        }
+
+        $hasSender = is_string($row['from'] ?? null) && trim((string) $row['from']) !== '';
+        $hasRecipient = is_string($row['to'] ?? null) && trim((string) $row['to']) !== '';
+        $hasBody = is_string($row['text'] ?? $row['body'] ?? null);
+        $hasReference = ! empty($row['in_reply_to']) || ! empty($row['message_id']);
+
+        return $hasSender && $hasRecipient && $hasBody && $hasReference;
     }
 
     /**
@@ -283,6 +357,23 @@ class WebhookController extends Controller
         }
 
         return $events;
+    }
+
+    /**
+     * Capture inbound WhatsApp messages and pass through bot automation.
+     */
+    private function captureInboundWhatsAppMessages(
+        string $provider,
+        Request $request,
+        BotConversationService $botConversationService
+    ): int {
+        $payload = $request->all();
+
+        if (! is_array($payload) || $payload === []) {
+            return 0;
+        }
+
+        return $botConversationService->captureWhatsAppInbound($provider, $payload);
     }
 
     /**

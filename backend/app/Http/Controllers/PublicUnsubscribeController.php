@@ -6,6 +6,7 @@ use App\Models\Activity;
 use App\Models\Lead;
 use App\Models\Tenant;
 use App\Models\Unsubscribe;
+use App\Services\ConsentService;
 use App\Support\UnsubscribeToken;
 use App\Tenancy\TenantContext;
 use Illuminate\Contracts\View\View;
@@ -17,7 +18,12 @@ class PublicUnsubscribeController extends Controller
     /**
      * Handle unsubscribe requests from tokenized links.
      */
-    public function __invoke(string $token, Request $request, UnsubscribeToken $unsubscribeToken): View
+    public function __invoke(
+        string $token,
+        Request $request,
+        UnsubscribeToken $unsubscribeToken,
+        ConsentService $consentService
+    ): View
     {
         $payload = $unsubscribeToken->parse($token);
 
@@ -40,7 +46,7 @@ class PublicUnsubscribeController extends Controller
 
         app(TenantContext::class)->setTenant($tenantId);
 
-        $result = DB::transaction(function () use ($request, $tenantId, $leadId, $channel, $value): array {
+        $result = DB::transaction(function () use ($request, $tenantId, $leadId, $channel, $value, $consentService): array {
             $lead = $this->resolveLead($tenantId, $leadId, $channel, $value);
 
             if ($lead !== null) {
@@ -55,6 +61,20 @@ class PublicUnsubscribeController extends Controller
                     'consent_updated_at' => now(),
                     'settings' => $settings,
                 ])->save();
+
+                $consentService->recordLeadConsent(
+                    lead: $lead->refresh(),
+                    channel: $channel,
+                    granted: false,
+                    source: 'unsubscribe_link',
+                    proofMethod: 'unsubscribe_url',
+                    proofRef: $value,
+                    context: [
+                        'unsubscribe_value' => $value,
+                    ],
+                    ipAddress: $request->ip(),
+                    userAgent: $request->userAgent(),
+                );
             }
 
             $unsubscribe = Unsubscribe::query()->updateOrCreate(

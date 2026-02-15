@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Models\Attachment;
 use App\Models\Lead;
 use App\Models\Segment;
 use App\Models\Template;
@@ -188,5 +189,161 @@ class SegmentsTemplatesAdminTest extends TestCase
             'channel' => 'whatsapp',
             'whatsapp_template_name' => 'wa_template_only',
         ])->assertUnprocessable();
+    }
+
+    public function test_whatsapp_template_render_supports_rich_media_and_carousel_settings(): void
+    {
+        $tenant = Tenant::factory()->create();
+        $admin = User::factory()->tenantAdmin()->create(['tenant_id' => $tenant->id]);
+        $lead = Lead::factory()->create([
+            'tenant_id' => $tenant->id,
+            'first_name' => 'Ahamed',
+            'city' => 'Riyadh',
+            'service' => 'implementation',
+        ]);
+
+        $asset = Attachment::query()->withoutTenancy()->create([
+            'tenant_id' => $tenant->id,
+            'lead_id' => null,
+            'entity_type' => 'media_library',
+            'entity_id' => $tenant->id,
+            'kind' => 'image',
+            'source' => 'manual',
+            'title' => 'City Banner',
+            'description' => null,
+            'storage_disk' => 'local',
+            'storage_path' => 'attachments/tenants/'.$tenant->id.'/media_library/banner.png',
+            'original_name' => 'banner.png',
+            'mime_type' => 'image/png',
+            'extension' => 'png',
+            'size_bytes' => 1024,
+            'checksum_sha256' => null,
+            'visibility' => 'private',
+            'scan_status' => 'skipped',
+            'scanned_at' => now(),
+            'scan_engine' => null,
+            'scan_result' => null,
+            'uploaded_by' => $admin->id,
+            'meta' => [],
+            'expires_at' => null,
+        ]);
+
+        Sanctum::actingAs($admin);
+
+        $create = $this->postJson('/api/admin/templates', [
+            'name' => 'WhatsApp Image Template',
+            'channel' => 'whatsapp',
+            'whatsapp_template_name' => 'unused_template',
+            'whatsapp_variables' => [],
+            'settings' => [
+                'whatsapp' => [
+                    'message_type' => 'image',
+                    'media' => [
+                        'attachment_id' => $asset->id,
+                        'link' => 'https://cdn.example.test/welcome-{{city}}.png',
+                        'caption' => 'Hi {{first_name}}',
+                    ],
+                ],
+            ],
+        ])->assertCreated()
+            ->assertJsonPath('template.settings.whatsapp.message_type', 'image');
+
+        $templateId = (int) $create->json('template.id');
+
+        $this->postJson('/api/admin/templates/'.$templateId.'/render', [
+            'lead_id' => $lead->id,
+        ])->assertOk()
+            ->assertJsonPath('rendered.message_type', 'image')
+            ->assertJsonPath('rendered.media.link', 'https://cdn.example.test/welcome-Riyadh.png')
+            ->assertJsonPath('rendered.media.caption', 'Hi Ahamed');
+
+        $this->patchJson('/api/admin/templates/'.$templateId, [
+            'settings' => [
+                'whatsapp' => [
+                    'message_type' => 'carousel',
+                    'text' => 'Please choose {{service}} package',
+                    'carousel' => [
+                        'body' => 'Cards for {{city}}',
+                        'cards' => [
+                            [
+                                'id' => 'basic',
+                                'title' => 'Basic {{city}}',
+                                'description' => 'Starter package',
+                            ],
+                            [
+                                'id' => 'pro',
+                                'title' => 'Pro {{city}}',
+                                'description' => 'Advanced package',
+                                'media' => [
+                                    'attachment_id' => $asset->id,
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ])->assertOk()
+            ->assertJsonPath('template.settings.whatsapp.message_type', 'carousel');
+
+        $this->postJson('/api/admin/templates/'.$templateId.'/render', [
+            'lead_id' => $lead->id,
+        ])->assertOk()
+            ->assertJsonPath('rendered.message_type', 'carousel')
+            ->assertJsonPath('rendered.text', 'Please choose implementation package')
+            ->assertJsonPath('rendered.carousel.body', 'Cards for Riyadh')
+            ->assertJsonPath('rendered.carousel.cards.0.title', 'Basic Riyadh');
+    }
+
+    public function test_template_render_preview_supports_dynamic_personalization_per_lead(): void
+    {
+        $tenant = Tenant::factory()->create();
+        $admin = User::factory()->tenantAdmin()->create(['tenant_id' => $tenant->id]);
+        $leadArabic = Lead::factory()->create([
+            'tenant_id' => $tenant->id,
+            'first_name' => null,
+            'city' => 'Riyadh',
+            'locale' => 'ar_SA',
+            'company' => null,
+        ]);
+        $leadEnglish = Lead::factory()->create([
+            'tenant_id' => $tenant->id,
+            'first_name' => 'Adam',
+            'city' => 'Dammam',
+            'locale' => 'en_US',
+            'company' => null,
+        ]);
+
+        Sanctum::actingAs($admin);
+
+        $create = $this->postJson('/api/admin/templates', [
+            'name' => 'Personalized Dynamic Template',
+            'channel' => 'email',
+            'subject' => '{{#if city=Riyadh}}Riyadh Offer{{else}}Global Offer{{/if}}',
+            'html' => '{{#lang ar}}مرحبا {{first_name|عميل}}{{/lang}}{{#lang en}}Hello {{first_name|Customer}}{{/lang}} from {{company|our team}}',
+        ])->assertCreated();
+
+        $templateId = (int) $create->json('template.id');
+
+        $this->postJson('/api/admin/templates/'.$templateId.'/render', [
+            'lead_ids' => [$leadArabic->id, $leadEnglish->id],
+        ])->assertOk()
+            ->assertJsonPath('previews.0.lead_id', $leadArabic->id)
+            ->assertJsonPath('previews.0.rendered.subject', 'Riyadh Offer')
+            ->assertJsonPath('previews.0.rendered.html', 'مرحبا عميل from our team')
+            ->assertJsonPath('previews.0.personalization.locale', 'ar-sa')
+            ->assertJsonPath('previews.1.lead_id', $leadEnglish->id)
+            ->assertJsonPath('previews.1.rendered.subject', 'Global Offer')
+            ->assertJsonPath('previews.1.rendered.html', 'Hello Adam from our team')
+            ->assertJsonPath('previews.1.personalization.locale', 'en-us');
+
+        $this->postJson('/api/admin/templates/'.$templateId.'/render', [
+            'lead_id' => $leadArabic->id,
+        ])->assertOk()
+            ->assertJsonPath('lead_id', $leadArabic->id)
+            ->assertJsonPath('rendered.subject', 'Riyadh Offer')
+            ->assertJsonPath('rendered.html', 'مرحبا عميل from our team')
+            ->assertJsonPath('personalization.conditions.evaluated', 1)
+            ->assertJsonPath('personalization.localization.evaluated', 2)
+            ->assertJsonPath('personalization.fallbacks_used.0.key', 'first_name');
     }
 }

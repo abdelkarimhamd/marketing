@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\ApiKey;
+use App\Models\Lead;
 use App\Models\Tenant;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
@@ -117,5 +118,57 @@ class PublicLeadIntakeTest extends TestCase
                 'email' => 'blocked@example.test',
             ])
             ->assertTooManyRequests();
+    }
+
+    public function test_public_lead_intake_auto_enriches_company_and_geo_from_email_domain(): void
+    {
+        config([
+            'enrichment.email.check_mx' => false,
+            'enrichment.company.domain_overrides' => [
+                'smartcedra.com' => [
+                    'name' => 'Smart Cedra',
+                    'city' => 'Riyadh',
+                    'country_code' => 'SA',
+                ],
+            ],
+        ]);
+
+        $tenant = Tenant::factory()->create(['slug' => 'enrich-tenant']);
+
+        $response = $this->withHeader('X-Tenant-Slug', $tenant->slug)
+            ->postJson('/api/public/leads', [
+                'email' => 'Sales@SmartCedra.com',
+            ]);
+
+        $response->assertCreated()
+            ->assertJsonPath('lead.email', 'sales@smartcedra.com')
+            ->assertJsonPath('lead.company', 'Smart Cedra')
+            ->assertJsonPath('lead.city', 'Riyadh')
+            ->assertJsonPath('lead.country_code', 'SA');
+
+        $lead = Lead::query()->withoutTenancy()->where('tenant_id', $tenant->id)->firstOrFail();
+
+        $this->assertSame('smartcedra.com', data_get($lead->meta, 'enrichment.email.domain'));
+        $this->assertSame('Smart Cedra', data_get($lead->meta, 'enrichment.company.value'));
+        $this->assertSame('override', data_get($lead->meta, 'enrichment.company.source'));
+    }
+
+    public function test_public_lead_intake_can_reject_disposable_email_when_enabled(): void
+    {
+        config([
+            'enrichment.email.check_mx' => false,
+            'enrichment.email.reject_disposable' => true,
+        ]);
+
+        $tenant = Tenant::factory()->create(['slug' => 'disposable-tenant']);
+
+        $this->withHeader('X-Tenant-Slug', $tenant->slug)
+            ->postJson('/api/public/leads', [
+                'email' => 'throwaway@mailinator.com',
+            ])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['email']);
+
+        $this->assertDatabaseCount('leads', 0);
     }
 }

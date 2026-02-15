@@ -4,6 +4,8 @@ namespace App\Tenancy;
 
 use App\Models\ApiKey;
 use App\Models\Tenant;
+use App\Models\TenantDomain;
+use App\Support\DomainHost;
 use Illuminate\Http\Request;
 
 class PublicTenantResolver
@@ -112,9 +114,30 @@ class PublicTenantResolver
     private function resolveByDomain(Request $request): ?Tenant
     {
         foreach ($this->domainCandidates($request) as $domain) {
+            $tenantDomain = TenantDomain::query()
+                ->withoutTenancy()
+                ->where('host', $domain)
+                ->where('verification_status', TenantDomain::VERIFICATION_VERIFIED)
+                ->whereHas('tenant', fn ($query) => $query->where('is_active', true))
+                ->with('tenant')
+                ->first();
+
+            if ($tenantDomain?->tenant !== null) {
+                return $tenantDomain->tenant;
+            }
+
             $tenant = Tenant::query()
                 ->where('domain', $domain)
                 ->where('is_active', true)
+                ->first();
+
+            if ($tenant !== null) {
+                return $tenant;
+            }
+
+            $tenant = Tenant::query()
+                ->where('is_active', true)
+                ->whereJsonContains('settings->domains', $domain)
                 ->first();
 
             if ($tenant !== null) {
@@ -188,10 +211,9 @@ class PublicTenantResolver
      */
     private function normalizeDomain(string $domain): ?string
     {
-        $domain = strtolower(trim($domain));
-        $domain = preg_replace('/:\d+$/', '', $domain) ?? $domain;
+        $domain = DomainHost::normalize($domain);
 
-        if ($domain === '' || $domain === 'localhost' || $domain === '127.0.0.1') {
+        if ($domain === null || DomainHost::isLocalHost($domain)) {
             return null;
         }
 

@@ -37,6 +37,7 @@ class Campaign extends Model
      */
     protected $fillable = [
         'tenant_id',
+        'brand_id',
         'segment_id',
         'template_id',
         'team_id',
@@ -92,6 +93,14 @@ class Campaign extends Model
     public function segment(): BelongsTo
     {
         return $this->belongsTo(Segment::class);
+    }
+
+    /**
+     * Brand profile powering this campaign.
+     */
+    public function brand(): BelongsTo
+    {
+        return $this->belongsTo(Brand::class);
     }
 
     /**

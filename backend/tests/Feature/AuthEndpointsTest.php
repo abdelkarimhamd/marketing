@@ -53,6 +53,31 @@ class AuthEndpointsTest extends TestCase
         $this->assertDatabaseCount('personal_access_tokens', 1);
     }
 
+    public function test_super_admin_login_ignores_tenant_scope_on_user_lookup(): void
+    {
+        $tenant = Tenant::factory()->create();
+        $superAdmin = User::factory()->create([
+            'tenant_id' => null,
+            'role' => UserRole::SuperAdmin->value,
+            'is_super_admin' => true,
+            'email' => 'root@example.test',
+            'password' => 'password',
+        ]);
+
+        $response = $this
+            ->withHeader('X-Tenant-ID', (string) $tenant->id)
+            ->postJson('/api/auth/login', [
+                'email' => $superAdmin->email,
+                'password' => 'password',
+                'device_name' => 'phpunit',
+            ]);
+
+        $response->assertOk()
+            ->assertJsonPath('token_type', 'Bearer')
+            ->assertJsonPath('user.email', $superAdmin->email)
+            ->assertJsonPath('user.role', UserRole::SuperAdmin->value);
+    }
+
     public function test_me_requires_authentication(): void
     {
         $this->getJson('/api/auth/me')

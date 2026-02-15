@@ -30,6 +30,7 @@ class TemplateFactory extends Factory
 
         return [
             'tenant_id' => Tenant::factory(),
+            'brand_id' => null,
             'name' => $name,
             'slug' => Str::slug($name),
             'channel' => 'email',

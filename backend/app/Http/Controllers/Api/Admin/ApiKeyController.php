@@ -16,7 +16,7 @@ class ApiKeyController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'api_keys.view');
         $tenantId = $this->resolveTenantId($request);
 
         $keys = ApiKey::query()
@@ -35,7 +35,7 @@ class ApiKeyController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'api_keys.create');
         $tenantId = $this->resolveTenantId($request);
 
         $payload = $request->validate([
@@ -74,7 +74,7 @@ class ApiKeyController extends Controller
      */
     public function revoke(Request $request, ApiKey $apiKey): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'api_keys.update');
         $this->ensureKeyBelongsToTenant($request, $apiKey);
 
         $apiKey->forceFill([
@@ -92,7 +92,7 @@ class ApiKeyController extends Controller
      */
     public function destroy(Request $request, ApiKey $apiKey): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'api_keys.delete');
         $this->ensureKeyBelongsToTenant($request, $apiKey);
 
         $apiKey->delete();
@@ -140,15 +140,4 @@ class ApiKeyController extends Controller
         }
     }
 
-    /**
-     * Ensure caller has admin permission.
-     */
-    private function authorizeAdmin(Request $request): void
-    {
-        $user = $request->user();
-
-        if (! $user || ! $user->isAdmin()) {
-            abort(403, 'Admin permissions are required.');
-        }
-    }
 }

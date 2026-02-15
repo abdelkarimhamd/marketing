@@ -19,6 +19,7 @@ class Message extends Model
      */
     protected $fillable = [
         'tenant_id',
+        'brand_id',
         'campaign_id',
         'campaign_step_id',
         'lead_id',
@@ -27,13 +28,26 @@ class Message extends Model
         'direction',
         'status',
         'channel',
+        'thread_key',
         'to',
         'from',
         'subject',
         'body',
         'provider',
         'provider_message_id',
+        'in_reply_to',
+        'reply_token',
+        'reply_to_email',
         'error_message',
+        'compliance_block_reason',
+        'cost_estimate',
+        'provider_cost',
+        'overhead_cost',
+        'revenue_amount',
+        'profit_amount',
+        'margin_percent',
+        'cost_tracked_at',
+        'cost_currency',
         'meta',
         'sent_at',
         'delivered_at',
@@ -58,6 +72,13 @@ class Message extends Model
             'clicked_at' => 'datetime',
             'read_at' => 'datetime',
             'failed_at' => 'datetime',
+            'cost_estimate' => 'decimal:4',
+            'provider_cost' => 'decimal:4',
+            'overhead_cost' => 'decimal:4',
+            'revenue_amount' => 'decimal:4',
+            'profit_amount' => 'decimal:4',
+            'margin_percent' => 'decimal:4',
+            'cost_tracked_at' => 'datetime',
         ];
     }
 
@@ -67,6 +88,14 @@ class Message extends Model
     public function campaign(): BelongsTo
     {
         return $this->belongsTo(Campaign::class);
+    }
+
+    /**
+     * Brand profile associated with this message.
+     */
+    public function brand(): BelongsTo
+    {
+        return $this->belongsTo(Brand::class);
     }
 
     /**

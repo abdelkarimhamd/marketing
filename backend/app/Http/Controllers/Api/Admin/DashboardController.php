@@ -7,9 +7,11 @@ use App\Models\Activity;
 use App\Models\Campaign;
 use App\Models\Lead;
 use App\Models\Message;
+use App\Models\Tenant;
 use App\Models\Segment;
 use App\Models\Template;
 use App\Models\WebhookInbox;
+use App\Services\HealthMetricsService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
@@ -18,9 +20,9 @@ class DashboardController extends Controller
     /**
      * Return aggregate dashboard metrics.
      */
-    public function index(Request $request): JsonResponse
+    public function index(Request $request, HealthMetricsService $healthService): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'dashboard.view');
 
         $metrics = [
             'leads_total' => Lead::query()->count(),
@@ -49,23 +51,23 @@ class DashboardController extends Controller
                 'created_at',
             ]);
 
+        $tenantHealth = null;
+        $tenantId = $request->attributes->get('tenant_id');
+
+        if (is_int($tenantId) && $tenantId > 0) {
+            $tenant = Tenant::query()->whereKey($tenantId)->first();
+
+            if ($tenant !== null) {
+                $tenantHealth = $healthService->tenantMetrics($tenant);
+            }
+        }
+
         return response()->json([
             'metrics' => $metrics,
             'recent_activities' => $recentActivities,
-            'tenant_id' => $request->attributes->get('tenant_id'),
+            'tenant_id' => $tenantId,
             'tenant_bypassed' => (bool) $request->attributes->get('tenant_bypassed', false),
+            'tenant_health' => $tenantHealth,
         ]);
-    }
-
-    /**
-     * Ensure caller has admin permission.
-     */
-    private function authorizeAdmin(Request $request): void
-    {
-        $user = $request->user();
-
-        if (! $user || ! $user->isAdmin()) {
-            abort(403, 'Admin permissions are required.');
-        }
     }
 }

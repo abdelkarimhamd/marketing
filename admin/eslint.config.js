@@ -24,6 +24,13 @@ export default defineConfig([
     },
     rules: {
       'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
+      'react-hooks/set-state-in-effect': 'off',
+    },
+  },
+  {
+    files: ['playwright.config.js', 'tests/e2e/**/*.js'],
+    languageOptions: {
+      globals: globals.node,
     },
   },
 ])

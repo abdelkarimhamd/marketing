@@ -9,6 +9,11 @@ use Carbon\CarbonInterface;
 
 class MessageStatusService
 {
+    public function __construct(
+        private readonly RealtimeEventService $realtimeEventService,
+    ) {
+    }
+
     /**
      * Apply outbound provider dispatch result.
      *
@@ -69,6 +74,19 @@ class MessageStatusService
                 'error' => $errorMessage,
             ]);
         }
+
+        $this->realtimeEventService->emit(
+            eventName: 'message.status.'.$status,
+            tenantId: (int) $model->tenant_id,
+            subjectType: Message::class,
+            subjectId: (int) $model->id,
+            payload: [
+                'provider' => $provider,
+                'lead_id' => $model->lead_id,
+                'campaign_id' => $model->campaign_id,
+                'status' => $status,
+            ],
+        );
 
         return $model->refresh();
     }
@@ -140,6 +158,19 @@ class MessageStatusService
             'error' => $errorMessage,
         ]);
 
+        $this->realtimeEventService->emit(
+            eventName: 'message.status.'.$status,
+            tenantId: (int) $message->tenant_id,
+            subjectType: Message::class,
+            subjectId: (int) $message->id,
+            payload: [
+                'provider' => $provider,
+                'lead_id' => $message->lead_id,
+                'campaign_id' => $message->campaign_id,
+                'status' => $status,
+            ],
+        );
+
         return $message->refresh();
     }
 
@@ -161,6 +192,17 @@ class MessageStatusService
             'source' => 'tracking',
         ] + $meta);
 
+        $this->realtimeEventService->emit(
+            eventName: 'message.opened',
+            tenantId: (int) $model->tenant_id,
+            subjectType: Message::class,
+            subjectId: (int) $model->id,
+            payload: [
+                'lead_id' => $model->lead_id,
+                'campaign_id' => $model->campaign_id,
+            ] + $meta,
+        );
+
         return $model->refresh();
     }
 
@@ -181,6 +223,17 @@ class MessageStatusService
         $this->recordActivity($model, 'message.tracking.clicked', [
             'source' => 'tracking',
         ] + $meta);
+
+        $this->realtimeEventService->emit(
+            eventName: 'message.clicked',
+            tenantId: (int) $model->tenant_id,
+            subjectType: Message::class,
+            subjectId: (int) $model->id,
+            payload: [
+                'lead_id' => $model->lead_id,
+                'campaign_id' => $model->campaign_id,
+            ] + $meta,
+        );
 
         return $model->refresh();
     }

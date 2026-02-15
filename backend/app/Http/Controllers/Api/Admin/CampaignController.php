@@ -4,12 +4,19 @@ namespace App\Http\Controllers\Api\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\Activity;
+use App\Models\Brand;
 use App\Models\Campaign;
 use App\Models\CampaignStep;
+use App\Models\HighRiskApproval;
 use App\Models\Segment;
 use App\Models\Team;
 use App\Models\Template;
+use App\Models\User;
 use App\Services\CampaignEngineService;
+use App\Services\HighRiskApprovalService;
+use App\Services\RealtimeEventService;
+use App\Services\SegmentEvaluationService;
+use App\Services\WorkflowVersioningService;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -25,7 +32,7 @@ class CampaignController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'campaigns.view');
 
         $filters = $request->validate([
             'search' => ['nullable', 'string', 'max:255'],
@@ -41,11 +48,13 @@ class CampaignController extends Controller
                 Campaign::TYPE_SCHEDULED,
                 Campaign::TYPE_DRIP,
             ])],
+            'brand_id' => ['nullable', 'integer', 'min:1'],
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
         ]);
 
         $query = Campaign::query()
             ->with([
+                'brand:id,name,slug',
                 'segment:id,name,slug',
                 'template:id,name,slug,channel',
                 'team:id,name',
@@ -72,6 +81,10 @@ class CampaignController extends Controller
             $query->where('campaign_type', $filters['campaign_type']);
         }
 
+        if (array_key_exists('brand_id', $filters) && is_numeric($filters['brand_id'])) {
+            $query->where('brand_id', (int) $filters['brand_id']);
+        }
+
         $campaigns = $query
             ->orderByDesc('id')
             ->paginate((int) ($filters['per_page'] ?? 15))
@@ -83,9 +96,14 @@ class CampaignController extends Controller
     /**
      * Store a campaign draft.
      */
-    public function store(Request $request, CampaignEngineService $engine): JsonResponse
+    public function store(
+        Request $request,
+        CampaignEngineService $engine,
+        WorkflowVersioningService $workflowVersioningService,
+        RealtimeEventService $eventService
+    ): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'campaigns.create');
 
         $tenantId = $this->resolveTenantIdForWrite($request);
         $payload = $this->validatePayload($request, $tenantId, false);
@@ -95,9 +113,13 @@ class CampaignController extends Controller
             $template = isset($payload['template_id'])
                 ? Template::query()->withoutTenancy()->where('tenant_id', $tenantId)->whereKey($payload['template_id'])->first()
                 : null;
+            $resolvedBrandId = array_key_exists('brand_id', $payload)
+                ? $payload['brand_id']
+                : ($template?->brand_id ?? null);
 
             $campaign = Campaign::query()->withoutTenancy()->create([
                 'tenant_id' => $tenantId,
+                'brand_id' => $resolvedBrandId,
                 'segment_id' => $payload['segment_id'] ?? null,
                 'template_id' => $payload['template_id'] ?? null,
                 'team_id' => $payload['team_id'] ?? null,
@@ -130,6 +152,24 @@ class CampaignController extends Controller
             return $campaign;
         });
 
+        $workflowVersioningService->snapshot(
+            subject: $campaign,
+            tenantId: (int) $campaign->tenant_id,
+            createdBy: $request->user()?->id,
+            status: 'draft',
+        );
+
+        $eventService->emit(
+            eventName: 'campaign.created',
+            tenantId: (int) $campaign->tenant_id,
+            subjectType: Campaign::class,
+            subjectId: (int) $campaign->id,
+            payload: [
+                'campaign_type' => $campaign->campaign_type,
+                'status' => $campaign->status,
+            ],
+        );
+
         return response()->json([
             'message' => 'Campaign created successfully.',
             'campaign' => $this->loadCampaign($campaign),
@@ -141,7 +181,7 @@ class CampaignController extends Controller
      */
     public function show(Request $request, Campaign $campaign): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'campaigns.view');
 
         return response()->json([
             'campaign' => $this->loadCampaign($campaign),
@@ -151,12 +191,18 @@ class CampaignController extends Controller
     /**
      * Update campaign.
      */
-    public function update(Request $request, Campaign $campaign, CampaignEngineService $engine): JsonResponse
+    public function update(
+        Request $request,
+        Campaign $campaign,
+        CampaignEngineService $engine,
+        WorkflowVersioningService $workflowVersioningService,
+        RealtimeEventService $eventService
+    ): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'campaigns.update');
 
         $payload = $this->validatePayload($request, (int) $campaign->tenant_id, true, $campaign);
-        $this->validateTenantReferences((int) $campaign->tenant_id, $payload);
+        $this->validateTenantReferences((int) $campaign->tenant_id, $payload, $campaign);
 
         DB::transaction(function () use ($request, $campaign, $payload, $engine): void {
             $template = null;
@@ -169,7 +215,12 @@ class CampaignController extends Controller
                     ->first();
             }
 
+            $resolvedBrandId = array_key_exists('brand_id', $payload)
+                ? $payload['brand_id']
+                : ($template?->brand_id ?? $campaign->brand_id);
+
             $campaign->fill([
+                'brand_id' => $resolvedBrandId,
                 'segment_id' => array_key_exists('segment_id', $payload) ? $payload['segment_id'] : $campaign->segment_id,
                 'template_id' => array_key_exists('template_id', $payload) ? $payload['template_id'] : $campaign->template_id,
                 'team_id' => array_key_exists('team_id', $payload) ? $payload['team_id'] : $campaign->team_id,
@@ -210,6 +261,24 @@ class CampaignController extends Controller
             ]);
         });
 
+        $workflowVersioningService->snapshot(
+            subject: $campaign->refresh(),
+            tenantId: (int) $campaign->tenant_id,
+            createdBy: $request->user()?->id,
+            status: 'draft',
+        );
+
+        $eventService->emit(
+            eventName: 'campaign.updated',
+            tenantId: (int) $campaign->tenant_id,
+            subjectType: Campaign::class,
+            subjectId: (int) $campaign->id,
+            payload: [
+                'campaign_type' => $campaign->campaign_type,
+                'status' => $campaign->status,
+            ],
+        );
+
         return response()->json([
             'message' => 'Campaign updated successfully.',
             'campaign' => $this->loadCampaign($campaign->refresh()),
@@ -221,7 +290,7 @@ class CampaignController extends Controller
      */
     public function destroy(Request $request, Campaign $campaign): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'campaigns.delete');
 
         $campaign->delete();
 
@@ -244,13 +313,15 @@ class CampaignController extends Controller
      */
     public function wizard(Request $request, Campaign $campaign, CampaignEngineService $engine): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'campaigns.update');
 
         $payload = $request->validate([
             'step' => ['required', Rule::in(['audience', 'content', 'schedule'])],
+            'brand_id' => ['nullable', 'integer', 'min:1', 'exists:brands,id'],
             'segment_id' => ['nullable', 'integer', 'exists:segments,id'],
             'template_id' => ['nullable', 'integer', 'exists:templates,id'],
             'channel' => ['nullable', Rule::in(['email', 'sms', 'whatsapp'])],
+            'journey_type' => ['nullable', Rule::in(['default', 'reengagement'])],
             'campaign_type' => ['nullable', Rule::in([
                 Campaign::TYPE_BROADCAST,
                 Campaign::TYPE_SCHEDULED,
@@ -262,6 +333,10 @@ class CampaignController extends Controller
             'stop_rules.opt_out' => ['nullable', 'boolean'],
             'stop_rules.won_lost' => ['nullable', 'boolean'],
             'stop_rules.replied' => ['nullable', 'boolean'],
+            'stop_rules.fatigue_enabled' => ['nullable', 'boolean'],
+            'stop_rules.fatigue_threshold_messages' => ['nullable', 'integer', 'min:1', 'max:1000'],
+            'stop_rules.fatigue_reengagement_messages' => ['nullable', 'integer', 'min:0', 'max:50'],
+            'stop_rules.fatigue_sunset' => ['nullable', 'boolean'],
             'drip_steps' => ['nullable', 'array', 'max:50'],
             'drip_steps.*.name' => ['nullable', 'string', 'max:255'],
             'drip_steps.*.day' => ['nullable', 'integer', 'min:0', 'max:365'],
@@ -274,11 +349,16 @@ class CampaignController extends Controller
         ]);
 
         $tenantId = (int) $campaign->tenant_id;
+        $this->validateTenantReferences($tenantId, $payload, $campaign);
 
         DB::transaction(function () use ($request, $campaign, $payload, $engine, $tenantId): void {
             $step = $payload['step'];
             $settings = is_array($campaign->settings) ? $campaign->settings : [];
             $wizard = is_array($settings['wizard'] ?? null) ? $settings['wizard'] : [];
+
+            if (array_key_exists('brand_id', $payload)) {
+                $campaign->brand_id = $payload['brand_id'];
+            }
 
             if ($step === 'audience') {
                 if (! isset($payload['segment_id'])) {
@@ -295,7 +375,6 @@ class CampaignController extends Controller
                     abort(422, 'template_id is required for content step.');
                 }
 
-                $this->validateTenantReferences($tenantId, ['template_id' => $payload['template_id']]);
                 $template = Template::query()
                     ->withoutTenancy()
                     ->where('tenant_id', $tenantId)
@@ -304,6 +383,15 @@ class CampaignController extends Controller
 
                 $campaign->template_id = $payload['template_id'];
                 $campaign->channel = $payload['channel'] ?? $template?->channel ?? $campaign->channel;
+
+                if (
+                    ! array_key_exists('brand_id', $payload)
+                    && $campaign->brand_id === null
+                    && $template?->brand_id !== null
+                ) {
+                    $campaign->brand_id = $template->brand_id;
+                }
+
                 $wizard['content'] = true;
             }
 
@@ -313,8 +401,20 @@ class CampaignController extends Controller
                 $campaign->start_at = array_key_exists('start_at', $payload) ? $payload['start_at'] : $campaign->start_at;
                 $campaign->end_at = array_key_exists('end_at', $payload) ? $payload['end_at'] : $campaign->end_at;
 
+                if (array_key_exists('journey_type', $payload)) {
+                    $settings['journey_type'] = $payload['journey_type'];
+                }
+
                 $settings['stop_rules'] = array_merge(
-                    ['opt_out' => true, 'won_lost' => true, 'replied' => true],
+                    [
+                        'opt_out' => true,
+                        'won_lost' => true,
+                        'replied' => true,
+                        'fatigue_enabled' => false,
+                        'fatigue_threshold_messages' => 6,
+                        'fatigue_reengagement_messages' => 1,
+                        'fatigue_sunset' => true,
+                    ],
                     is_array($payload['stop_rules'] ?? null) ? $payload['stop_rules'] : []
                 );
                 $wizard['schedule'] = true;
@@ -363,13 +463,69 @@ class CampaignController extends Controller
     /**
      * Launch campaign processing.
      */
-    public function launch(Request $request, Campaign $campaign, CampaignEngineService $engine): JsonResponse
+    public function launch(
+        Request $request,
+        Campaign $campaign,
+        CampaignEngineService $engine,
+        SegmentEvaluationService $segmentEvaluationService,
+        HighRiskApprovalService $approvalService
+    ): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'campaigns.send');
+        $campaign = $campaign->refresh();
+        $this->ensureCampaignReadyForLaunch($campaign);
 
-        $this->ensureCampaignReadyForLaunch($campaign->refresh());
+        $payload = $request->validate([
+            'approval_id' => ['nullable', 'integer', 'min:1'],
+            'approval_reason' => ['nullable', 'string', 'max:2000'],
+        ]);
+
+        $user = $request->user();
+
+        if (! $user instanceof User) {
+            abort(401, 'Authentication is required.');
+        }
+
+        $audienceCount = $this->resolveAudienceCountForApproval($campaign, $segmentEvaluationService);
+        $approvalDecision = $approvalService->authorizeOrRequest(
+            tenantId: (int) $campaign->tenant_id,
+            actor: $user,
+            action: 'campaign.mass_send',
+            subjectType: Campaign::class,
+            subjectId: (int) $campaign->id,
+            payload: [
+                'campaign_id' => (int) $campaign->id,
+                'campaign_type' => (string) $campaign->campaign_type,
+                'channel' => (string) $campaign->channel,
+                'audience_count' => $audienceCount,
+            ],
+            approvalId: isset($payload['approval_id']) ? (int) $payload['approval_id'] : null,
+            reason: $payload['approval_reason'] ?? null,
+        );
+
+        if (! ($approvalDecision['execute'] ?? false)) {
+            return response()->json([
+                'message' => 'Campaign launch requires approval before execution.',
+                'requires_approval' => true,
+                'approval' => $approvalDecision['approval'] ?? null,
+            ], 202);
+        }
 
         $engine->launchCampaign($campaign->refresh());
+
+        $approval = $approvalDecision['approval'] ?? null;
+
+        if ($approval instanceof HighRiskApproval) {
+            $approvalService->markExecuted(
+                approval: $approval,
+                executedBy: (int) $user->id,
+                executionMeta: [
+                    'action' => 'campaign.mass_send',
+                    'campaign_id' => (int) $campaign->id,
+                    'audience_count' => $audienceCount,
+                ],
+            );
+        }
 
         Activity::query()->withoutTenancy()->create([
             'tenant_id' => $campaign->tenant_id,
@@ -383,6 +539,7 @@ class CampaignController extends Controller
         return response()->json([
             'message' => 'Campaign launch queued successfully.',
             'campaign' => $this->loadCampaign($campaign->refresh()),
+            'approval_id' => $approval instanceof HighRiskApproval ? (int) $approval->id : null,
         ]);
     }
 
@@ -408,10 +565,12 @@ class CampaignController extends Controller
             'name' => ['sometimes', 'string', 'max:255'],
             'slug' => ['sometimes', 'string', 'max:255', $slugRule],
             'description' => ['sometimes', 'nullable', 'string', 'max:2000'],
+            'brand_id' => ['sometimes', 'nullable', 'integer', 'min:1', 'exists:brands,id'],
             'segment_id' => ['sometimes', 'nullable', 'integer', 'exists:segments,id'],
             'template_id' => ['sometimes', 'nullable', 'integer', 'exists:templates,id'],
             'team_id' => ['sometimes', 'nullable', 'integer', 'exists:teams,id'],
             'channel' => ['sometimes', Rule::in(['email', 'sms', 'whatsapp'])],
+            'journey_type' => ['sometimes', Rule::in(['default', 'reengagement'])],
             'campaign_type' => ['sometimes', Rule::in([
                 Campaign::TYPE_BROADCAST,
                 Campaign::TYPE_SCHEDULED,
@@ -431,6 +590,10 @@ class CampaignController extends Controller
             'stop_rules.opt_out' => ['nullable', 'boolean'],
             'stop_rules.won_lost' => ['nullable', 'boolean'],
             'stop_rules.replied' => ['nullable', 'boolean'],
+            'stop_rules.fatigue_enabled' => ['nullable', 'boolean'],
+            'stop_rules.fatigue_threshold_messages' => ['nullable', 'integer', 'min:1', 'max:1000'],
+            'stop_rules.fatigue_reengagement_messages' => ['nullable', 'integer', 'min:0', 'max:50'],
+            'stop_rules.fatigue_sunset' => ['nullable', 'boolean'],
             'drip_steps' => ['sometimes', 'nullable', 'array', 'max:50'],
             'drip_steps.*.name' => ['nullable', 'string', 'max:255'],
             'drip_steps.*.day' => ['nullable', 'integer', 'min:0', 'max:365'],
@@ -454,8 +617,28 @@ class CampaignController extends Controller
      *
      * @param array<string, mixed> $payload
      */
-    private function validateTenantReferences(int $tenantId, array $payload): void
+    private function validateTenantReferences(int $tenantId, array $payload, ?Campaign $campaign = null): void
     {
+        $effectiveBrandId = null;
+
+        if (array_key_exists('brand_id', $payload)) {
+            $effectiveBrandId = $payload['brand_id'] !== null ? (int) $payload['brand_id'] : null;
+        } elseif ($campaign?->brand_id !== null) {
+            $effectiveBrandId = (int) $campaign->brand_id;
+        }
+
+        if (array_key_exists('brand_id', $payload) && $payload['brand_id'] !== null) {
+            $brandExists = Brand::query()
+                ->withoutTenancy()
+                ->where('tenant_id', $tenantId)
+                ->whereKey((int) $payload['brand_id'])
+                ->exists();
+
+            if (! $brandExists) {
+                abort(422, 'Provided brand_id does not belong to the active tenant.');
+            }
+        }
+
         if (array_key_exists('segment_id', $payload) && $payload['segment_id'] !== null) {
             $exists = Segment::query()
                 ->withoutTenancy()
@@ -468,15 +651,35 @@ class CampaignController extends Controller
             }
         }
 
-        if (array_key_exists('template_id', $payload) && $payload['template_id'] !== null) {
-            $exists = Template::query()
+        $templateIdForCompatibility = null;
+
+        if (array_key_exists('template_id', $payload)) {
+            $templateIdForCompatibility = $payload['template_id'] !== null
+                ? (int) $payload['template_id']
+                : null;
+        } elseif ($campaign instanceof Campaign && array_key_exists('brand_id', $payload)) {
+            $templateIdForCompatibility = $campaign->template_id !== null
+                ? (int) $campaign->template_id
+                : null;
+        }
+
+        if ($templateIdForCompatibility !== null) {
+            $template = Template::query()
                 ->withoutTenancy()
                 ->where('tenant_id', $tenantId)
-                ->whereKey($payload['template_id'])
-                ->exists();
+                ->whereKey($templateIdForCompatibility)
+                ->first();
 
-            if (! $exists) {
+            if (! $template instanceof Template) {
                 abort(422, 'Provided template_id does not belong to the active tenant.');
+            }
+
+            if (
+                $effectiveBrandId !== null
+                && $template->brand_id !== null
+                && (int) $template->brand_id !== $effectiveBrandId
+            ) {
+                abort(422, 'Provided template_id does not belong to the selected brand.');
             }
         }
 
@@ -497,14 +700,22 @@ class CampaignController extends Controller
                 continue;
             }
 
-            $exists = Template::query()
+            $template = Template::query()
                 ->withoutTenancy()
                 ->where('tenant_id', $tenantId)
                 ->whereKey((int) $step['template_id'])
-                ->exists();
+                ->first();
 
-            if (! $exists) {
+            if (! $template instanceof Template) {
                 abort(422, 'One or more drip step template_id values do not belong to the active tenant.');
+            }
+
+            if (
+                $effectiveBrandId !== null
+                && $template->brand_id !== null
+                && (int) $template->brand_id !== $effectiveBrandId
+            ) {
+                abort(422, 'One or more drip step templates do not belong to the selected brand.');
             }
         }
     }
@@ -543,6 +754,32 @@ class CampaignController extends Controller
     }
 
     /**
+     * Resolve audience size for high-risk approval threshold checks.
+     */
+    private function resolveAudienceCountForApproval(
+        Campaign $campaign,
+        SegmentEvaluationService $segmentEvaluationService
+    ): int {
+        $segment = $campaign->segment;
+
+        if ($segment === null && $campaign->segment_id !== null) {
+            $segment = Segment::query()
+                ->withoutTenancy()
+                ->where('tenant_id', $campaign->tenant_id)
+                ->whereKey($campaign->segment_id)
+                ->first();
+        }
+
+        if (! $segment instanceof Segment) {
+            return 0;
+        }
+
+        return (int) $segmentEvaluationService
+            ->queryForSegment($segment)
+            ->count();
+    }
+
+    /**
      * Resolve tenant id for write operations.
      */
     private function resolveTenantIdForWrite(Request $request): int
@@ -572,9 +809,21 @@ class CampaignController extends Controller
         $settings = is_array($existing) ? $existing : [];
         $settings = array_merge($settings, is_array($payload['settings'] ?? null) ? $payload['settings'] : []);
 
+        if (array_key_exists('journey_type', $payload) && is_string($payload['journey_type'])) {
+            $settings['journey_type'] = $payload['journey_type'];
+        }
+
         if (array_key_exists('stop_rules', $payload) && is_array($payload['stop_rules'])) {
             $settings['stop_rules'] = array_merge(
-                ['opt_out' => true, 'won_lost' => true, 'replied' => true],
+                [
+                    'opt_out' => true,
+                    'won_lost' => true,
+                    'replied' => true,
+                    'fatigue_enabled' => false,
+                    'fatigue_threshold_messages' => 6,
+                    'fatigue_reengagement_messages' => 1,
+                    'fatigue_sunset' => true,
+                ],
                 $payload['stop_rules']
             );
         }
@@ -583,23 +832,12 @@ class CampaignController extends Controller
     }
 
     /**
-     * Ensure caller has admin permission.
-     */
-    private function authorizeAdmin(Request $request): void
-    {
-        $user = $request->user();
-
-        if (! $user || ! $user->isAdmin()) {
-            abort(403, 'Admin permissions are required.');
-        }
-    }
-
-    /**
      * Load campaign with required relations.
      */
     private function loadCampaign(Campaign $campaign): Campaign
     {
         return $campaign->load([
+            'brand:id,name,slug',
             'segment:id,name,slug',
             'template:id,name,slug,channel',
             'team:id,name',

@@ -3,11 +3,14 @@
 namespace App\Http\Middleware;
 
 use App\Models\Tenant;
+use App\Models\TenantDomain;
 use App\Models\User;
+use App\Support\DomainHost;
 use App\Tenancy\TenantContext;
 use Closure;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\App;
 use Symfony\Component\HttpFoundation\Response;
 
 class SetTenant
@@ -26,11 +29,40 @@ class SetTenant
         if ($user?->isSuperAdmin()) {
             $this->applySuperAdminContext($request, $context, $switchWasRequested, $requestedTenantId);
         } else {
-            $this->applyStandardContext($context, $user, $switchWasRequested, $requestedTenantId);
+            $this->applyStandardContext($request, $context, $user, $switchWasRequested, $requestedTenantId);
         }
 
         $request->attributes->set('tenant_id', $context->tenantId());
         $request->attributes->set('tenant_bypassed', $context->isBypassed());
+
+        $tenantId = $context->tenantId();
+
+        if (is_int($tenantId) && $tenantId > 0) {
+            $tenant = Tenant::query()
+                ->whereKey($tenantId)
+                ->first(['locale', 'timezone']);
+
+            $locale = is_string($tenant?->locale) ? trim($tenant->locale) : '';
+            $timezone = is_string($tenant?->timezone) ? trim($tenant->timezone) : '';
+
+            if ($locale !== '') {
+                App::setLocale($locale);
+            }
+
+            if ($timezone !== '') {
+                try {
+                    date_default_timezone_set($timezone);
+                } catch (\Throwable) {
+                    // Ignore invalid timezone values and keep app default.
+                }
+            }
+        }
+
+        if ($user instanceof User && ! $user->isSuperAdmin() && $user->tenant_id !== null) {
+            $user->forceFill([
+                'last_seen_at' => now(),
+            ])->saveQuietly();
+        }
 
         return $next($request);
     }
@@ -85,6 +117,7 @@ class SetTenant
      * Resolve tenant context for non super-admin requests.
      */
     private function applyStandardContext(
+        Request $request,
         TenantContext $context,
         ?User $user,
         bool $switchWasRequested,
@@ -110,6 +143,14 @@ class SetTenant
 
         if ($switchWasRequested && $requestedTenantId !== null) {
             $context->setTenant($this->ensureTenantExists($requestedTenantId));
+
+            return;
+        }
+
+        $hostTenantId = $this->resolveTenantIdFromHost($request);
+
+        if ($hostTenantId !== null) {
+            $context->setTenant($hostTenantId);
 
             return;
         }
@@ -189,5 +230,37 @@ class SetTenant
         $webUser = Auth::guard('web')->user();
 
         return $webUser instanceof User ? $webUser : null;
+    }
+
+    /**
+     * Resolve tenant by request host using verified custom domains first.
+     */
+    private function resolveTenantIdFromHost(Request $request): ?int
+    {
+        $host = DomainHost::normalize($request->getHost());
+
+        if ($host === null || DomainHost::isLocalHost($host)) {
+            return null;
+        }
+
+        $mappedTenantId = TenantDomain::query()
+            ->withoutTenancy()
+            ->where('host', $host)
+            ->where('verification_status', TenantDomain::VERIFICATION_VERIFIED)
+            ->whereHas('tenant', fn ($query) => $query->where('is_active', true))
+            ->value('tenant_id');
+
+        if (is_numeric($mappedTenantId) && (int) $mappedTenantId > 0) {
+            return (int) $mappedTenantId;
+        }
+
+        $legacyTenantId = Tenant::query()
+            ->where('domain', $host)
+            ->where('is_active', true)
+            ->value('id');
+
+        return is_numeric($legacyTenantId) && (int) $legacyTenantId > 0
+            ? (int) $legacyTenantId
+            : null;
     }
 }

@@ -16,7 +16,7 @@ class CampaignLogController extends Controller
      */
     public function index(Request $request, Campaign $campaign): JsonResponse
     {
-        $this->authorizeAdmin($request);
+        $this->authorizePermission($request, 'campaigns.view');
 
         $payload = $request->validate([
             'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
@@ -59,15 +59,4 @@ class CampaignLogController extends Controller
         return response()->json($logs);
     }
 
-    /**
-     * Ensure caller has admin permission.
-     */
-    private function authorizeAdmin(Request $request): void
-    {
-        $user = $request->user();
-
-        if (! $user || ! $user->isAdmin()) {
-            abort(403, 'Admin permissions are required.');
-        }
-    }
 }

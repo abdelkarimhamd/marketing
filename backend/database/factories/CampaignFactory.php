@@ -34,6 +34,7 @@ class CampaignFactory extends Factory
 
         return [
             'tenant_id' => Tenant::factory(),
+            'brand_id' => null,
             'segment_id' => Segment::factory(),
             'template_id' => Template::factory(),
             'team_id' => Team::factory(),

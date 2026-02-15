@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Middleware\ResolvePublicTenant;
+use App\Http\Middleware\RequestContextLogging;
 use App\Http\Middleware\SetTenant;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
@@ -16,11 +17,14 @@ return Application::configure(basePath: dirname(__DIR__))
     ->withMiddleware(function (Middleware $middleware) {
         $middleware->alias([
             'resolve.public_tenant' => ResolvePublicTenant::class,
+            'request.context' => RequestContextLogging::class,
             'set.tenant' => SetTenant::class,
         ]);
 
         $middleware->appendToGroup('web', SetTenant::class);
+        $middleware->appendToGroup('web', RequestContextLogging::class);
         $middleware->appendToGroup('api', SetTenant::class);
+        $middleware->appendToGroup('api', RequestContextLogging::class);
     })
     ->withExceptions(function (Exceptions $exceptions) {
         //

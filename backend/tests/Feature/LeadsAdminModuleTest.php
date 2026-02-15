@@ -93,6 +93,54 @@ class LeadsAdminModuleTest extends TestCase
         $this->assertDatabaseHas('leads', ['id' => $leadB->id, 'status' => 'contacted']);
     }
 
+    public function test_admin_lead_store_auto_enriches_company_phone_country_and_carrier(): void
+    {
+        config([
+            'enrichment.email.check_mx' => false,
+        ]);
+
+        $tenant = Tenant::factory()->create();
+        $admin = User::factory()->tenantAdmin()->create(['tenant_id' => $tenant->id]);
+
+        Sanctum::actingAs($admin);
+
+        $response = $this->postJson('/api/admin/leads', [
+            'first_name' => 'Nora',
+            'email' => 'owner@acme.sa',
+            'phone' => '050 123 4567',
+            'country_code' => 'sa',
+        ]);
+
+        $response->assertCreated()
+            ->assertJsonPath('lead.email', 'owner@acme.sa')
+            ->assertJsonPath('lead.phone', '+966501234567')
+            ->assertJsonPath('lead.country_code', 'SA')
+            ->assertJsonPath('lead.company', 'Acme');
+
+        $leadId = (int) $response->json('lead.id');
+        $lead = Lead::query()->withoutTenancy()->findOrFail($leadId);
+
+        $this->assertSame('stc', data_get($lead->meta, 'enrichment.phone.carrier'));
+        $this->assertSame('SA', data_get($lead->meta, 'enrichment.phone.country_code'));
+    }
+
+    public function test_import_requires_valid_phone_when_email_is_missing(): void
+    {
+        $tenant = Tenant::factory()->create();
+        $admin = User::factory()->tenantAdmin()->create(['tenant_id' => $tenant->id]);
+
+        Sanctum::actingAs($admin);
+
+        $this->postJson('/api/admin/leads/import', [
+            'leads' => [
+                [
+                    'phone' => 'invalid-number',
+                ],
+            ],
+        ])->assertUnprocessable()
+            ->assertJsonValidationErrors(['phone']);
+    }
+
     public function test_assignment_rules_crud_is_available_for_admins(): void
     {
         $tenant = Tenant::factory()->create();
@@ -132,6 +180,50 @@ class LeadsAdminModuleTest extends TestCase
         ])->assertOk()
             ->assertJsonPath('rule.strategy', 'interest_service')
             ->assertJsonPath('rule.is_active', false);
+    }
+
+    public function test_assignment_rule_can_store_actions_for_rules_engine(): void
+    {
+        $tenant = Tenant::factory()->create();
+        $admin = User::factory()->tenantAdmin()->create(['tenant_id' => $tenant->id]);
+        $owner = User::factory()->sales()->create(['tenant_id' => $tenant->id]);
+
+        Sanctum::actingAs($admin);
+
+        $response = $this->postJson('/api/admin/assignment-rules', [
+            'name' => 'Advanced Routing',
+            'strategy' => 'rules_engine',
+            'priority' => 1,
+            'conditions' => [
+                'sources' => ['website'],
+            ],
+            'actions' => [
+                [
+                    'type' => 'assign',
+                    'owner_id' => $owner->id,
+                ],
+                [
+                    'type' => 'notify_channel',
+                    'channel' => 'slack:sales',
+                    'message' => 'Lead {{email}} routed.',
+                ],
+            ],
+        ])->assertCreated();
+
+        $ruleId = (int) $response->json('rule.id');
+
+        $this->assertDatabaseHas('assignment_rules', [
+            'id' => $ruleId,
+            'tenant_id' => $tenant->id,
+            'strategy' => 'rules_engine',
+        ]);
+
+        $stored = \App\Models\AssignmentRule::query()->withoutTenancy()->findOrFail($ruleId);
+        $actions = data_get($stored->settings, 'actions', []);
+
+        $this->assertCount(2, is_array($actions) ? $actions : []);
+        $this->assertSame('assign', data_get($actions, '0.type'));
+        $this->assertSame('notify_channel', data_get($actions, '1.type'));
     }
 
     public function test_sales_user_cannot_access_admin_lead_module(): void
